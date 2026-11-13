@@ -1,0 +1,202 @@
+// gateway.rs — 把网关装进应用里：一个开关、一个端口、一个 token。
+//
+// 这里只管生命周期和那两行配置文件；真正干活的是 server.rs。之所以要一个 token：
+// 这个端口对整台机器开放，任何本地进程都能连；一个留在磁盘上的随机串让「谁在用」
+// 是明确的，而不是「谁先连上算谁的」。
+//
+// 端口和 token 存在 ~/.zcode-switch/gateway.json，重启后还是同一个，客户端不用改配置。
+pub mod accounts;
+pub mod dress;
+pub mod pool;
+pub mod prompt;
+pub mod server;
+pub mod translate;
+pub mod upstream;
+
+use std::net::TcpListener;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+use tokio::sync::oneshot;
+
+use crate::gateway::pool::{Opts, Pool};
+use crate::store::Paths;
+
+pub const DEFAULT_PORT: u16 = 8794;
+
+struct Running {
+    port: u16,
+    stop: Option<oneshot::Sender<()>>,
+    started: Instant,
+}
+
+fn slot() -> &'static Mutex<Option<Running>> {
+    static SLOT: OnceLock<Mutex<Option<Running>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn config_file(paths: &Paths) -> PathBuf {
+    paths.store_dir().join("gateway.json")
+}
+
+fn read_config(paths: &Paths) -> Value {
+    std::fs::read_to_string(config_file(paths))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn write_config(paths: &Paths, v: &Value) {
+    let _ = std::fs::create_dir_all(paths.store_dir());
+    if let Ok(s) = serde_json::to_string_pretty(v) {
+        let _ = std::fs::write(config_file(paths), s);
+    }
+}
+
+fn mint_token() -> String {
+    format!(
+        "zsg_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// token 是这份安装自己的凭据。没有就造一个并写下来：造一次，别每次启动换个新的，
+/// 否则客户端的配置每重启一次就失效。
+pub fn token_for(paths: &Paths) -> String {
+    let mut cfg = read_config(paths);
+    let existing = cfg
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| t.len() >= 12)
+        .map(String::from);
+    match existing {
+        Some(t) => t,
+        None => {
+            let t = mint_token();
+            if let Some(o) = cfg.as_object_mut() {
+                o.insert("token".into(), Value::String(t.clone()));
+            }
+            write_config(paths, &cfg);
+            t
+        }
+    }
+}
+
+pub fn saved_port(paths: &Paths) -> u16 {
+    read_config(paths)
+        .get("port")
+        .and_then(|p| p.as_u64())
+        .filter(|p| *p > 1024 && *p < 65535)
+        .map(|p| p as u16)
+        .unwrap_or(DEFAULT_PORT)
+}
+
+fn bind(from: u16) -> Result<TcpListener, String> {
+    // 端口被占了就往后挪几个：换一个端口比让用户去查是谁占着更省事
+    let mut last = String::new();
+    for port in from..from.saturating_add(10) {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => return Ok(l),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!("could not bind a loopback port from {from}: {last}"))
+}
+
+pub fn status_of(paths: &Paths) -> Value {
+    let guard = slot().lock().unwrap_or_else(|e| e.into_inner());
+    let base = match guard.as_ref() {
+        Some(r) => format!("http://127.0.0.1:{}/v1", r.port),
+        None => format!("http://127.0.0.1:{}/v1", saved_port(paths)),
+    };
+    let targets = accounts::load_targets(paths, true, None, None);
+    json!({
+        "running": guard.is_some(),
+        "port": guard.as_ref().map(|r| r.port).unwrap_or_else(|| saved_port(paths)),
+        "base": base,
+        "token": token_for(paths),
+        "uptime_s": guard.as_ref().map(|r| r.started.elapsed().as_secs()).unwrap_or(0),
+        "targets": targets.len(),
+        "models": accounts::models_of(&targets),
+    })
+}
+
+/// start 起一个本地网关。端口从参数、上次用过的、默认值里挑，占了就往后挪。
+pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
+    {
+        let guard = slot().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(status_of(&paths));
+        }
+    }
+    let token = token_for(&paths);
+    let want = port.unwrap_or_else(|| saved_port(&paths));
+    let listener = bind(want)?;
+    let actual = listener.local_addr().map(|a| a.port()).unwrap_or(want);
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
+
+    let pool = Pool::new(Opts::default());
+    let ctx = server::Ctx::new(paths.clone(), pool, token.clone(), true);
+    ctx.targets();
+    let app = server::router(ctx);
+    let (tx, rx) = oneshot::channel::<()>();
+    // 用 tauri 的执行器起这个任务：它是 tokio，而且是应用自己的那个运行时
+    tauri::async_runtime::spawn(async move {
+        let served = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+        if let Err(e) = served {
+            eprintln!("gateway stopped: {e}");
+        }
+    });
+
+    {
+        let mut guard = slot().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(Running { port: actual, stop: Some(tx), started: Instant::now() });
+    }
+    let mut cfg = read_config(&paths);
+    if let Some(o) = cfg.as_object_mut() {
+        o.insert("port".into(), json!(actual));
+        o.insert("token".into(), Value::String(token));
+    }
+    write_config(&paths, &cfg);
+    Ok(status_of(&paths))
+}
+
+pub fn stop(paths: &Paths) -> Value {
+    {
+        let mut guard = slot().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut r) = guard.take() {
+            if let Some(tx) = r.stop.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+    // 让 graceful shutdown 走完再报状态，界面上的「已停止」才是真的
+    std::thread::sleep(Duration::from_millis(150));
+    status_of(paths)
+}
+
+// ---------------------------------------------------------------- 给界面的口
+
+#[tauri::command]
+pub fn gateway_status() -> Value {
+    status_of(&Paths::detect())
+}
+
+#[tauri::command]
+pub async fn gateway_start(port: Option<u16>) -> Result<Value, String> {
+    start(Paths::detect(), port).await
+}
+
+#[tauri::command]
+pub fn gateway_stop() -> Value {
+    stop(&Paths::detect())
+}

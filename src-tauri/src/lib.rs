@@ -5,6 +5,7 @@ pub mod changelog;
 pub mod claim;
 mod diag;
 mod flowlog;
+pub mod gateway;
 mod glass;
 mod oauth;
 mod probe;
@@ -1856,6 +1857,9 @@ pub fn run() {
             open_settings,
             reveal_main,
             glass::glass_sync,
+            gateway::gateway_status,
+            gateway::gateway_start,
+            gateway::gateway_stop,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

@@ -9,6 +9,12 @@ come from Z·SWITCH, the HTTP surface is new. Nothing here writes to your ZCode
 install — it reads the saved accounts and one live sign-in, and sends what the
 desktop app would have sent.
 
+**This Node build is the reference implementation.** The app now ships its own
+copy in Rust (`src-tauri/src/gateway`, same pool/translate/dress behaviour, a
+settings switch and `--cli gateway`); this directory is where the behaviour was
+worked out and where it can be measured without building Tauri. When the two
+disagree, the Rust one is what users run — fix both.
+
     npm run gateway                # listen on 127.0.0.1:8787
     npm run gateway -- --list      # what it would send with, then exit
     npm run gateway -- --port 9000 --quiet

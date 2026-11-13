@@ -25,6 +25,19 @@ Tauri 2 桌面工具：在多个 ZCode 账号之间一键切换，自动显示�
 - **加密导出**：PBKDF2-HMAC-SHA256（100k 迭代）+ AES-256-GCM，随机 salt/nonce；错密码即失败，无明文痕迹
 - **凭据只在本地解密**：凭据解密仅用于显示用户名/邮箱；导出文件凭口令加密
 
+## 本地反代（测试版）
+
+把本机已保存的 ZCode 账号变成一个 OpenAI 兼容的本地接口：`http://127.0.0.1:8794/v1`。设置页打开开关即可（会显示可复制的地址与 token），也可以走 CLI。
+
+- 端点：`GET /v1/models`、`POST /v1/chat/completions`（OpenAI 格式）、`POST /v1/messages`（Anthropic 格式，原样透传）、`GET /healthz`（每个账号的套餐与今日收发）
+- 模型名按套餐自己的写法：`GLM-5.3-Flash`、`GLM-5.3`
+- 只监听回环地址，需要 Bearer token（首次启动自动生成，存于 `~/.zcode-switch/gateway.json`）
+- 并发：一个账号同一时刻只发一条请求（实测 Start Plan 的上限就是 1，不是 3），账号之间并行；同一账号两次开始至少间隔 800ms
+- 重试：`3008`/`3009`/`3010`（并发）不换账号，等 1~2 秒再问同一个账号；`1005`/`1113`（没套餐/没额度）才换账号；整条 IP 被拒（405）时全部暂停 3 分钟
+- 请求外壳与 ZCode 客户端一致（3 段 system、会话 id、设备指纹），因此每条请求的 prompt 会多出约 1070 token
+
+已知限制：这是测试版；厂商侧有 IP 级风控，长期高频可能被 405 拦一段时间（应用会自己退避）；Start Plan 的登录 token 不会自动续期，过期需在 ZCode 里重新登录。
+
 ## CLI
 
 ```
@@ -38,6 +51,7 @@ zcode-switch.exe --cli export --id <id> --out <a.zsb>
 zcode-switch.exe --cli export-all --out <all.zsb>
 zcode-switch.exe --cli import --file <file.zsb>
 zcode-switch.exe --cli rename|delete|update|behavior|setpath|launch
+zcode-switch.exe --cli gateway status|start [--port <port>]|stop
 zcode-switch.exe --cli --lang en state              # 英文输出（--lang 空格传值、可置于任意位置；默认跟 GUI 语言/系统语言）
 ```
 

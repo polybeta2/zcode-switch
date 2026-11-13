@@ -39,6 +39,7 @@ fn detached(mut c: std::process::Command) -> std::process::Command {
     c
 }
 
+#[derive(Clone)]
 pub struct Paths {
     pub home: PathBuf,
     pub data_root: PathBuf,

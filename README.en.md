@@ -25,6 +25,19 @@ A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, 
 - **Encrypted export**: PBKDF2-HMAC-SHA256 (100k iterations) + AES-256-GCM, random salt/nonce; wrong password simply fails, no plaintext traces
 - **Credentials decrypted locally only**: decryption is used solely to display username/email; export files are password-encrypted
 
+## Local gateway (test build)
+
+Turns the ZCode accounts saved on this machine into one OpenAI-compatible local endpoint: `http://127.0.0.1:8794/v1`. Flip the switch on the settings page (it shows a copyable base URL and token), or use the CLI.
+
+- Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (OpenAI), `POST /v1/messages` (Anthropic, forwarded byte for byte), `GET /healthz` (per-account plan and traffic)
+- Model names are spelled by the plan itself: `GLM-5.3-Flash`, `GLM-5.3`
+- Loopback only, and a Bearer token is required (minted on first start, kept in `~/.zcode-switch/gateway.json`)
+- Concurrency: one request in flight per account (a Start Plan really serves one at a time — the "3" is the client plugin's own gate), accounts run in parallel, and two starts on one account are spaced by 800ms
+- Retries: `3008`/`3009`/`3010` (concurrency) do not switch accounts — the same account is asked again after 1–2s; `1005`/`1113` (no plan / no quota) switch; a refused address (405) rests every account for three minutes
+- Requests are dressed like the ZCode client (three system blocks, session id, device fingerprint), so every request costs about 1070 extra prompt tokens
+
+Known limits: this is a test build; the vendor rate-limits by address, so sustained high volume can earn a 405 for a while (the gateway backs off on its own); and a Start Plan sign-in does not refresh itself — when it expires, sign in again in ZCode.
+
 ## CLI
 
 ```
@@ -38,6 +51,7 @@ zcode-switch.exe --cli export --id <id> --out <a.zsb>
 zcode-switch.exe --cli export-all --out <all.zsb>
 zcode-switch.exe --cli import --file <file.zsb>
 zcode-switch.exe --cli rename|delete|update|behavior|setpath|launch
+zcode-switch.exe --cli gateway status|start [--port <port>]|stop
 zcode-switch.exe --cli --lang en state              # English output (--lang takes a space-separated value, works anywhere in the command line; defaults to the GUI/system language)
 ```
 

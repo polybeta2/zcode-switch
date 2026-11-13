@@ -8,12 +8,14 @@ import { IS_MAC, initGlass } from "./glass.js";
 const $app = document.getElementById("app");
 let state = null;
 let autostart = false;
+let gateway = null;
 let busy = false;
 let appVer = "";
 
 async function refresh() {
   state = await invoke("get_state");
   autostart = await invoke("autostart_status").catch(() => false);
+  gateway = await invoke("gateway_status").catch(() => null);
   if (state?.language) init(state.language);
 }
 
@@ -153,6 +155,45 @@ const actions = {
         state.auth_proxy_on ? t("s.proxySavedOn") : t("s.proxySavedOff"));
     });
   },
+
+  // 网关：一个开关，一句地址。开始/停止之后从后端拿回真实状态（端口被占时会挪号），
+  // 界面只显示后端说的那个端口，不自己猜。
+  async toggleGateway() {
+    if (busy) return;
+    busy = true;
+    try {
+      const on = !(gateway && gateway.running);
+      gateway = on ? await invoke("gateway_start", { port: null }) : await invoke("gateway_stop");
+      render();
+      toast(on ? t("s.gatewayOn") : t("s.gatewayOff"), "ok", gateway.base || "");
+    } catch (e) {
+      toast(t("s.gatewayToggle"), "bad", String(e));
+    } finally {
+      busy = false;
+    }
+  },
+
+  async copyGateway() {
+    const text = (gateway && gateway.base) || "";
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(t("s.gatewayCopied"), "ok", text);
+    } catch (e) {
+      toast(t("s.gatewayCopy"), "bad", String(e));
+    }
+  },
+
+  async copyGatewayToken() {
+    const text = (gateway && gateway.token) || "";
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(t("s.gatewayCopiedToken"), "ok", "");
+    } catch (e) {
+      toast(t("s.gatewayCopyToken"), "bad", String(e));
+    }
+  },
 };
 
 const toggle = (on, onclickAttr, label, desc) => `
@@ -203,6 +244,14 @@ function render() {
           placeholder="${t("s.proxyPh")}" keydown="onProxyKey(event)">
         <button class="btn-ghost" click="actions.saveProxy()">${t("common.save")}</button>
       </div>
+      <label style="margin-top:14px">${t("s.gatewayLabel")}</label>
+      ${toggle(gateway && gateway.running, "actions.toggleGateway()", t("s.gatewayToggle"), t("s.gatewayToggleDesc"))}
+      <div class="path-line" style="margin-top:6px">
+        <input class="zcode-path" type="text" readonly value="${esc((gateway && gateway.base) || "")}" />
+        <button class="btn-ghost" click="actions.copyGateway()">${t("s.gatewayCopy")}</button>
+        <button class="btn-ghost" click="actions.copyGatewayToken()">${t("s.gatewayCopyToken")}</button>
+      </div>
+      <div class="hint">${t("s.gatewayHint", { n: (gateway && gateway.targets) || 0, m: ((gateway && gateway.models) || []).join(", ") || "—" })}</div>
       <label style="margin-top:14px">${t("s.libLabel")}</label>
       <div class="lib-row">
         <button class="btn-ghost has-ic" click="actions.importFiles()">${ic("import", 14)} ${t("s.importBtn")}</button>
@@ -249,6 +298,17 @@ function renderMac(s) {
             placeholder="${t("s.proxyPh")}" keydown="onProxyKey(event)">
           <button class="btn-ghost" click="actions.saveProxy()">${t("common.save")}</button>
         </div>
+      </div>
+
+      <div class="s-group-label">${t("s.gatewayLabel")}</div>
+      <div class="s-group s-pad">
+        ${toggle(gateway && gateway.running, "actions.toggleGateway()", t("s.gatewayToggle"), t("s.gatewayToggleDesc"))}
+        <div class="path-line" style="margin-top:6px">
+          <input class="zcode-path" type="text" readonly value="${esc((gateway && gateway.base) || "")}" />
+          <button class="btn-ghost" click="actions.copyGateway()">${t("s.gatewayCopy")}</button>
+          <button class="btn-ghost" click="actions.copyGatewayToken()">${t("s.gatewayCopyToken")}</button>
+        </div>
+        <div class="hint">${t("s.gatewayHint", { n: (gateway && gateway.targets) || 0, m: ((gateway && gateway.models) || []).join(", ") || "—" })}</div>
       </div>
 
       <div class="s-group-label">${t("mac.accounts")}</div>

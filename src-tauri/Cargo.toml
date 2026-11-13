@@ -31,6 +31,12 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 ureq = { version = "2", features = ["json", "native-tls"] }
 native-tls = "0.2"
 sys-locale = "0.3"
+# 本地网关（测试版反代）：它是全项目唯一异步、唯一流式的地方，所以另起一套。
+# reqwest 默认走 native-tls，Windows 上就是 Schannel，与上面 ureq 的选择一致。
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["stream", "json"] }
+futures-util = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

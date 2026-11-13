@@ -442,6 +442,54 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Err(e) => return (err(&e), 1),
             }
         }
+        "gateway" => {
+            let sub = rest.first().map(|s| s.as_str()).unwrap_or("status");
+            match sub {
+                "status" => {
+                    let st = crate::gateway::status_of(&paths);
+                    let port = st.get("port").and_then(|p| p.as_u64()).unwrap_or(0);
+                    // 端口上到底有没有人在答，只有真连一次才知道：界面里的状态说的
+                    // 是「这个进程里有没有」，而 CLI 是另一个进程
+                    let listening = ureq::AgentBuilder::new()
+                        .timeout(std::time::Duration::from_millis(800))
+                        .build()
+                        .get(&format!("http://127.0.0.1:{port}/healthz"))
+                        .call()
+                        .is_ok();
+                    let mut v = st;
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("listening".into(), Value::Bool(listening));
+                    }
+                    ok(v)
+                }
+                "start" => {
+                    let port = flag(rest, "--port").and_then(|p| p.parse::<u16>().ok());
+                    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                        Ok(r) => r,
+                        Err(e) => return (err(&e.to_string()), 1),
+                    };
+                    let started = match rt.block_on(crate::gateway::start(paths.clone(), port)) {
+                        Ok(v) => v,
+                        Err(e) => return (err(&e), 1),
+                    };
+                    println!("{}", ok(started.clone()));
+                    let base = started.get("base").and_then(|b| b.as_str()).unwrap_or("");
+                    eprintln!("serving on {base} — Ctrl+C to stop");
+                    // 前台跑到 Ctrl+C：CLI 起的网关活在这个进程里，进程没了网关就没了
+                    let _ = rt.block_on(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    });
+                    crate::gateway::stop(&paths);
+                    return (ok(json!({ "stopped": true })), 0);
+                }
+                "stop" => {
+                    // 别的进程起的网关，这个进程停不了：说清楚，而不是假装停了
+                    let st = crate::gateway::stop(&paths);
+                    ok(json!({ "stopped_here": true, "note": "if the app started it, stop it from the app", "status": st }))
+                }
+                other => return (err(&format!("gateway: unknown subcommand {other} (status|start|stop)")), 2),
+            }
+        }
         other => return (err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])), 2),
     };
     (out, 0)
