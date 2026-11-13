@@ -4,7 +4,8 @@
 // 这个端口对整台机器开放，任何本地进程都能连；一个留在磁盘上的随机串让「谁在用」
 // 是明确的，而不是「谁先连上算谁的」。
 //
-// 端口和 token 存在 ~/.zcode-switch/gateway.json，重启后还是同一个，客户端不用改配置。
+// token 存在 ~/.zcode-switch/gateway.json（造一次就不再变）；端口固定 127.0.0.1:8794，
+// 客户端把这条 base URL 写死才安全 —— 见下面 bind() 的注释，端口不能自己漂。
 pub mod accounts;
 pub mod dress;
 pub mod pool;
@@ -86,37 +87,38 @@ pub fn token_for(paths: &Paths) -> String {
     }
 }
 
-pub fn saved_port(paths: &Paths) -> u16 {
-    read_config(paths)
-        .get("port")
-        .and_then(|p| p.as_u64())
-        .filter(|p| *p > 1024 && *p < 65535)
-        .map(|p| p as u16)
-        .unwrap_or(DEFAULT_PORT)
+/// 固定端口：客户端配置里写的是这个地址，所以它不能跟着「上回用了哪个」变。
+/// 旧版本会把实际端口写进 gateway.json，端口一漂就把客户端甩在原地 —— 这里不再读它。
+fn fixed_port() -> u16 {
+    DEFAULT_PORT
 }
 
-fn bind(from: u16) -> Result<TcpListener, String> {
-    // 端口被占了就往后挪几个：换一个端口比让用户去查是谁占着更省事
-    let mut last = String::new();
-    for port in from..from.saturating_add(10) {
-        match TcpListener::bind(("127.0.0.1", port)) {
-            Ok(l) => return Ok(l),
-            Err(e) => last = e.to_string(),
+fn bind(port: u16) -> Result<TcpListener, String> {
+    // 端口就是客户端配置里写死的那个 base URL：占了就明说，不偷偷往后挪。
+    // 曾经这里是「往后挪 10 个」，实测代价是：本地留了一个测试实例占着 8795，
+    // 界面一开网关就静悄悄坐到 8796 并把 8796 写回 gateway.json，
+    // 而 DSH 那边还连着 127.0.0.1:8794 —— 表现为「网关明明开着，却 connect-refused」。
+    TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            format!(
+                "端口 {port} 已被占用：先关掉占用它的程序；或用 --port 换一个端口，并把客户端的 base URL 一起改掉"
+            )
+        } else {
+            format!("端口 {port} 无法绑定：{e}")
         }
-    }
-    Err(format!("could not bind a loopback port from {from}: {last}"))
+    })
 }
 
 pub fn status_of(paths: &Paths) -> Value {
     let guard = slot().lock().unwrap_or_else(|e| e.into_inner());
     let base = match guard.as_ref() {
         Some(r) => format!("http://127.0.0.1:{}/v1", r.port),
-        None => format!("http://127.0.0.1:{}/v1", saved_port(paths)),
+        None => format!("http://127.0.0.1:{}/v1", fixed_port()),
     };
     let targets = accounts::load_targets(paths, true, None, None);
     json!({
         "running": guard.is_some(),
-        "port": guard.as_ref().map(|r| r.port).unwrap_or_else(|| saved_port(paths)),
+        "port": guard.as_ref().map(|r| r.port).unwrap_or_else(fixed_port),
         "base": base,
         "token": token_for(paths),
         "uptime_s": guard.as_ref().map(|r| r.started.elapsed().as_secs()).unwrap_or(0),
@@ -125,7 +127,7 @@ pub fn status_of(paths: &Paths) -> Value {
     })
 }
 
-/// start 起一个本地网关。端口从参数、上次用过的、默认值里挑，占了就往后挪。
+/// start 起一个本地网关：端口只认 `--port` 或默认 8794，占了就报错，不往后挪。
 pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
     {
         let guard = slot().lock().unwrap_or_else(|e| e.into_inner());
@@ -134,7 +136,7 @@ pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
         }
     }
     let token = token_for(&paths);
-    let want = port.unwrap_or_else(|| saved_port(&paths));
+    let want = port.unwrap_or_else(fixed_port);
     let listener = bind(want)?;
     let actual = listener.local_addr().map(|a| a.port()).unwrap_or(want);
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -163,7 +165,8 @@ pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
     }
     let mut cfg = read_config(&paths);
     if let Some(o) = cfg.as_object_mut() {
-        o.insert("port".into(), json!(actual));
+        // 端口不再落盘：写进去就等于给下一次启动留了个「漂到别处」的理由
+        o.remove("port");
         o.insert("token".into(), Value::String(token));
     }
     write_config(&paths, &cfg);
