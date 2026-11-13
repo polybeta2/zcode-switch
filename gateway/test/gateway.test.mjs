@@ -161,7 +161,7 @@ test("kindOf reads the vendor's refusals as claims a client can act on", () => {
 })
 
 test("the pool gives an account its slots, then refuses rather than piling on", async () => {
-  const pool = new Pool([target()], { inflight: 2, rpm: 0, queueMs: 150 })
+  const pool = new Pool([target()], { inflight: 2, startGapMs: 0, rpm: 0, queueMs: 150 })
   const a = await pool.acquire()
   const b = await pool.acquire()
   assert.equal(a.target.inflight, 2)
@@ -171,6 +171,42 @@ test("the pool gives an account its slots, then refuses rather than piling on", 
   assert.equal(a.target.inflight, 1)
   b.release()
   assert.equal(a.target.inflight, 0)
+})
+
+test("an account starts one request at a time, spaced by its gap", async () => {
+  // measured on a live plan (../probe): two requests sent in the same instant
+  // get exactly one served and one 3008 in ~150ms, so the pool holds the second
+  // back rather than spending a refusal to learn what it already knows
+  const pool = new Pool([target()], { inflight: 3, rpm: 0, queueMs: 3000 })
+  const at = Date.now()
+  const a = await pool.acquire()
+  const b = await pool.acquire()
+  assert.ok(Date.now() - at >= pool.opts.startGapMs - 100, "the second start waited its gap")
+  assert.equal(a.target.inflight, 2)
+  a.release()
+  b.release()
+})
+
+test("a busy refusal is answered by asking again, not by spending the account", async (t) => {
+  // the account says "not this instant" once and then serves: with one account
+  // to spend, the gateway must retry it rather than give up or report 429
+  const plan = await fakePlan((body, n) => (n === 1 ? { json: { code: 3008, msg: "user concurrency limit exceeded" } } : { json: messagesAnswer("asked again") }))
+  const pool = new Pool([target({ base: plan.base })], { rpm: 0 })
+  const gateway = createGateway({ pool, token: "tok", log: () => {}, version: "test", busyWaits: [10, 20] })
+  const base = await listening(gateway)
+  t.after(() => {
+    gateway.close()
+    plan.server.close()
+  })
+  const res = await fetch(base + "/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: "Bearer tok", "content-type": "application/json" },
+    body: JSON.stringify({ model: "glm-4.6", messages: [{ role: "user", content: "hi" }] }),
+  })
+  assert.equal(res.status, 200)
+  const j = await res.json()
+  assert.equal(j.choices[0].message.content, "asked again")
+  assert.equal(plan.seen.length, 2, "the same account was asked twice")
 })
 
 test("a busy refusal narrows an account, and five of them make it rest", () => {

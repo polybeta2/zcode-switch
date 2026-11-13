@@ -28,7 +28,14 @@ function parseArgs(argv) {
     plans: null,
     accounts: null,
     includeLive: true,
-    inflight: 3,
+    // measured 2026-11-13 on a Start Plan: one request in flight per account.
+    // Two at once on the same account earns 3008 immediately (probe ramp: every
+    // level above 1 served exactly one and refused the rest, 22/22 as 3008), and
+    // a refusal arrives in ~150ms — an admission decision, not a slow answer.
+    inflight: 1,
+    // starts on one account are spaced this far apart: at 1.2s a second request
+    // overlaps the first and is served, at 0 it is refused
+    gap: 800,
     rpm: 12,
     queueMs: 120000,
     defaultMaxTokens: 4096,
@@ -54,6 +61,7 @@ function parseArgs(argv) {
       case "--accounts": out.accounts = next().split(",").map((s) => s.trim()).filter(Boolean); break
       case "--no-live": out.includeLive = false; break
       case "--inflight": out.inflight = Number(next()); break
+      case "--gap": out.gap = Number(next()); break
       case "--rpm": out.rpm = Number(next()); break
       case "--queue-ms": out.queueMs = Number(next()); break
       case "--default-max-tokens": out.defaultMaxTokens = Number(next()); break
@@ -127,7 +135,8 @@ const HELP = [
   "  --plans <a,b>         start | coding | api (default: all, best first)",
   "  --accounts <a,b>      account ids or names (default: all)",
   "  --no-live             do not include ZCode's own live sign-in",
-  "  --inflight <n>        requests per account at once (default 3)",
+  "  --inflight <n>        requests per account at once (default 1, as measured)",
+  "  --gap <ms>            shortest gap between two starts on one account (default 800)",
   "  --rpm <n>             starts per minute per address (default 12, 0 = off)",
   "  --queue-ms <n>        how long a request may wait for a slot (default 120000)",
   "  --default-max-tokens  used when a Messages request omits max_tokens",
@@ -164,7 +173,7 @@ async function main() {
 
   const { token, source } = loadToken(opts)
   const log = opts.quiet ? () => {} : (m) => console.log(new Date().toISOString().slice(11, 19) + "  " + m)
-  const pool = new Pool(targets, { inflight: opts.inflight, rpm: opts.rpm, queueMs: opts.queueMs, log })
+  const pool = new Pool(targets, { inflight: opts.inflight, startGapMs: opts.gap, rpm: opts.rpm, queueMs: opts.queueMs, log })
   const server = createGateway({ pool, token, defaultMaxTokens: opts.defaultMaxTokens, log, version: VERSION })
 
   if (opts.dryRun) {
@@ -206,7 +215,9 @@ async function main() {
     console.log("    -d '{\"model\":\"" + (canServe[0] || "glm-4.6") + "\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}'")
     console.log("")
     console.log("  Every account goes out from this one address: the vendor's cap is per account,")
-    console.log("  the firewall's is per address. Keep " + opts.inflight + " in flight per account at most.")
+    console.log("  the firewall's is per address. " + opts.inflight + " in flight per account at most;")
+    console.log("  the plan refuses a second one with 3008, so extra accounts buy concurrency,")
+    console.log("  not extra speed.")
     console.log("")
   })
 

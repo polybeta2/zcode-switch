@@ -51,6 +51,11 @@ The last level where every request was served is the account's ceiling; the
 first level that produced `busy` is the cap. Two rounds per level, so one lucky
 answer cannot be mistaken for a ceiling.
 
+`--stagger <ms>` spreads the launches inside a level instead of firing them in
+the same instant. That distinction is the whole finding below: a plan refuses a
+burst of arrivals, not an overlap — the same requests 1.2 s apart overlap and are
+served.
+
 **models** — whether a 3009 (the model's own in-flight cap) is per model or per
 account. It fires three at once on a single model, then three at once on three
 different models, and compares. If the second set is served where the first was
@@ -112,6 +117,27 @@ from a known state rather than from a guess:
   body (which is exactly what this probe did first).
 - The token carries `iat` and no `exp`, so it does not lapse on a clock — what
   stops it is a spent or absent plan, and re-signing-in.
+
+## with a live plan (2026-11-13, 23:00–23:30)
+
+The free *ZCODE WEEKEND BUILD* plan came on for five of the saved accounts
+(`zcode-v3-start-plan-1113-wk`, 23:00 → 03:00). Against one of them:
+
+- **A plan serves one request at a time.** Three, four and five fired in the same
+  instant each served exactly one and refused the rest with `3008` in ~150 ms —
+  22 refusals over the ladder, nothing else. `3009`/`3010` never appeared.
+- **What it refuses is the burst, not the overlap.** Fired 1.2 s apart, requests
+  are served while earlier ones are still running: `i=0 ok (1222 ms)`,
+  `i=1 ok (1200→4635 ms)`, `i=2 busy 153 ms`, `i=3 busy 130 ms`,
+  `i=4 ok (859 ms)`, `i=5 ok (1247 ms)`. Every refusal lines up with a second
+  request already in flight; the successes line up with the account being free.
+- So the plugin's `maxConcurrency: 3` is a client-side gate, not the vendor's
+  number: it admits three at once and answers each `3008` by waiting a second and
+  asking again. A gateway that paces its starts gets the same throughput without
+  spending refusals — see `../gateway` (`--inflight 1`, 800 ms start gap).
+- Every successful answer still costs ~1076 prompt tokens of dressing, and a
+  thinking model spends `max_tokens` on `reasoning_content` first: with 48 tokens
+  the content is empty, with 64 it is a few words.
 
 ## tonight
 

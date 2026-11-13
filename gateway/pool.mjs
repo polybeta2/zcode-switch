@@ -30,9 +30,21 @@ const now = () => Date.now()
 export class Pool {
   constructor(targets, opts = {}) {
     this.opts = {
-      // how many requests one account may have in flight; the vendor's own cap
-      // is about three, and the plugin ships that number (magpie maxConcurrency)
-      inflight: 3,
+      // how many requests one account may have in flight: ONE, measured.
+      // ../probe fired requests 1.2s apart and recorded the timeline exactly —
+      // i=0 ok (1222ms), i=1 ok (1200→4635ms), i=2 and i=3 refused with 3008 in
+      // ~150ms while i=1 was still running, i=4 and i=5 ok once it had finished.
+      // Nothing overlapped without a 3008. The plugin's maxConcurrency: 3 is a
+      // client-side gate, not the vendor's cap: it admits three and then answers
+      // each 3008 by waiting a second and asking again, which is why its log
+      // reads "up to ~10 in flight against a cap of about three". Spacing the
+      // starts is what makes a queue look like three-at-once.
+      inflight: 1,
+      // the shortest gap between two starts on one account: a second request
+      // sent in the same instant as the first is refused in ~150ms
+      startGapMs: 800,
+      // after a 3008 the account is skipped for this long, then tried again
+      busyCooldownMs: 1200,
       // how long a request may wait for a slot before it is refused
       queueMs: 120_000,
       // starts per minute across every account of this address; 0 is no limit,
@@ -51,7 +63,23 @@ export class Pool {
       authMs: 600_000,
       ...opts,
     }
-    this.targets = targets.map((t) => ({ ...t, inflight: 0, limit: this.opts.inflight, narrowUntil: 0, narrowLimit: 0, holdUntil: 0, holdWhy: "", doubles: [], lastUsed: 0, served: 0, refused: 0 }))
+    this.targets = targets.map((t) => ({
+      ...t,
+      inflight: 0,
+      limit: this.opts.inflight,
+      narrowUntil: 0,
+      narrowLimit: 0,
+      gapUntil: 0,
+      gapNow: 0,
+      busyUntil: 0,
+      holdUntil: 0,
+      holdWhy: "",
+      doubles: [],
+      lastUsed: 0,
+      lastStart: 0,
+      served: 0,
+      refused: 0,
+    }))
     this.edgeUntil = 0
     this.edgeWhy = ""
     this.starts = []
@@ -74,6 +102,20 @@ export class Pool {
     return t.limit
   }
 
+  // gapOf is the pacing this account is under right now: the default, or the
+  // wider one a burst refusal bought it.
+  gapOf(t) {
+    return t.gapUntil > now() && t.gapNow > 0 ? t.gapNow : this.opts.startGapMs
+  }
+
+  // pending counts the accounts a request could still reach: not excluded, not
+  // resting. When it is zero, waiting for a slot would only spend the queue.
+  pending(exclude = new Set()) {
+    const at = now()
+    if (this.edgeUntil > at) return 0
+    return this.targets.filter((t) => !exclude.has(t) && t.holdUntil <= at).length
+  }
+
   // pick chooses the account a request should use: the one with the most room
   // relative to its own limit, and the earliest used among equals, so a queue
   // spreads over accounts instead of piling on the first.
@@ -87,6 +129,10 @@ export class Pool {
     for (const t of this.targets) {
       if (exclude.has(t)) continue
       if (t.holdUntil > at) continue
+      // a 3008 says "not this instant", not "not this account": wait it out
+      if (t.busyUntil > at) continue
+      // and leave the account its gap, which is what the burst refusal asked for
+      if (at - t.lastStart < this.gapOf(t)) continue
       const limit = this.limitOf(t)
       if (t.inflight >= limit) continue
       const score = (t.inflight + 1) / limit
@@ -128,6 +174,7 @@ export class Pool {
         if (t.inflight >= this.limitOf(t) || t.holdUntil > now()) continue
         t.inflight++
         t.lastUsed = now()
+        t.lastStart = now()
         this.starts.push(now())
         let released = false
         return {

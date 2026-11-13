@@ -28,6 +28,7 @@ const HELP = `probe.mjs — ZCode Start Plan behaviour probe
   --levels 1,2,3,4,6     concurrency per round, ramp mode
   --rounds 2             rounds per level
   --gap 45000            ms to rest between rounds
+  --stagger 0            ms between launches inside a level (0 = all at once)
   --model GLM-5.3-Flash  the model a ramp uses
   --models a,b,c          models mode: three at once, one each
   --prompt "..."         the user text each request carries
@@ -59,6 +60,7 @@ async function main() {
       levels: { type: "string", default: "1,2,3,4,6" },
       rounds: { type: "string", default: "2" },
       gap: { type: "string", default: "45000" },
+      stagger: { type: "string", default: "0" },
       model: { type: "string", default: "GLM-5.3-Flash" },
       models: { type: "string", default: "GLM-5.3-Flash,GLM-5.2,GLM-5-Turbo" },
       prompt: { type: "string", default: "Reply with exactly: ok" },
@@ -261,6 +263,7 @@ async function main() {
     const levels = String(v.levels).split(",").map((n) => Number(n.trim())).filter((n) => n > 0 && n <= 16)
     const rounds = Math.max(1, Number(v.rounds) || 1)
     const gap = Math.max(0, Number(v.gap) || 0)
+    const stagger = Math.max(0, Number(v.stagger) || 0)
     const stamp = Date.now().toString(36)
 
     for (const level of levels) {
@@ -269,8 +272,18 @@ async function main() {
       for (let roundNo = 1; roundNo <= rounds; roundNo++) {
         if (stopped) break
         const reqs = Array.from({ length: level }, (_, i) => mk(v.model, `probe-${stamp}-L${level}-R${roundNo}-${i}`))
-        console.log(`\nlevel ${level}  round ${roundNo}/${rounds}  firing ${level} at once …`)
-        const results = (await Promise.all(reqs.map((q, i) => send(q, { level, round: roundNo, i })))).filter(Boolean)
+        console.log(
+          `\nlevel ${level}  round ${roundNo}/${rounds}  firing ${level} ` +
+            (stagger ? `staggered by ${stagger}ms …` : "at once …"),
+        )
+        const results = (
+          await Promise.all(
+            reqs.map(async (q, i) => {
+              if (stagger && i) await sleep(i * stagger)
+              return send(q, { level, round: roundNo, i })
+            }),
+          )
+        ).filter(Boolean)
         const counts = summarizeCounts(results)
         runs.push({ level, round: roundNo, results, counts })
         console.log(`  ${countsLine(counts)}  (${Math.max(...results.map((r) => r.ms), 0)}ms worst)`)

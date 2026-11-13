@@ -168,16 +168,32 @@ export function createGateway({ pool, token = "", defaultMaxTokens = 4096, log =
       )
     }
 
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // A request is not given three attempts, it is given the queue's time. With a
+    // dozen saved accounts of which most have no plan, counting attempts spends
+    // them on dead accounts and then refuses a request that a live plan could
+    // have served. So: run until the deadline, keep a busy account eligible
+    // (3008 means "not this instant", not "not this account"), and drop only the
+    // accounts that said they cannot serve at all.
+    const deadline = Date.now() + (pool.opts?.queueMs || 120_000)
+    for (let attempt = 0; attempt < 32 && Date.now() < deadline; attempt++) {
+      const exclude = new Set([...tried, ...unfit])
+      if (pool.pending(exclude) === 0) break
       let slot
       try {
-        slot = await pool.acquire({ exclude: new Set([...tried, ...unfit]) })
+        slot = await pool.acquire({ exclude })
       } catch (e) {
         const kind = e instanceof PoolError ? e.kind : "other"
-        return fail(res, STATUS_FOR[kind] || 503, e.message, kind === "edge" ? "upstream_error" : "rate_limit_error")
+        // busy after every plan answered "no quota" is a quota answer, not a
+        // traffic one, and 402 is what a client knows how to act on
+        const late = kind === "busy" && tried.size ? "spent" : kind
+        return fail(
+          res,
+          STATUS_FOR[late] || 503,
+          late === "spent" ? lastSaid : e.message,
+          late === "edge" ? "upstream_error" : late === "spent" ? "insufficient_quota" : "rate_limit_error",
+        )
       }
       const { target, release } = slot
-      tried.add(target)
       const sessionId = sessionOf(seed, target.device)
       // the plan is addressed by its own spelling of the model
       const served = modelFor(target, want) || want
@@ -191,6 +207,7 @@ export function createGateway({ pool, token = "", defaultMaxTokens = 4096, log =
         lastSaid = "the vendor did not answer: " + e.message
         lastKind = /cancelled/.test(e.message) ? "aborted" : "timeout"
         if (lastKind === "aborted") return fail(res, 499, lastSaid, "cancelled")
+        tried.add(target)
         log(target.label + ": " + lastSaid)
         continue
       }
@@ -243,14 +260,19 @@ export function createGateway({ pool, token = "", defaultMaxTokens = 4096, log =
       log(target.label + " refused (" + (code || up.status) + "): " + lastSaid.slice(0, 160))
       if (kind === "edge") return fail(res, 503, "the address is resting: " + lastSaid, "upstream_error", code || up.status)
       if (kind === "busy" || kind === "rate") {
-        await sleep(busyWaits[attempt] || 2000)
+        // the vendor's own advice, and what the plugin does: wait a moment and
+        // ask the same account again rather than spending another one
+        await sleep(busyWaits[Math.min(attempt, busyWaits.length - 1)] || 2000)
         continue
       }
-      if (kind === "spent" || kind === "auth" || kind === "risk" || kind === "timeout") continue
-      if (attempt < 2) continue
-      break
+      tried.add(target)
     }
-    return fail(res, STATUS_FOR[lastKind] || 502, lastSaid, lastKind === "spent" ? "insufficient_quota" : "upstream_error")
+    return fail(
+      res,
+      STATUS_FOR[lastKind] || 502,
+      lastSaid || "no account answered",
+      lastKind === "spent" ? "insufficient_quota" : lastKind === "busy" || lastKind === "rate" ? "rate_limit_error" : "upstream_error",
+    )
   }
 
   // pipeChat forwards a streamed answer while it is being written.
@@ -320,16 +342,22 @@ export function createGateway({ pool, token = "", defaultMaxTokens = 4096, log =
         "model_not_found",
       )
     }
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // the same policy as /v1/chat/completions: time, not an attempt count
+    const deadline = Date.now() + (pool.opts?.queueMs || 120_000)
+    let lastKind = "other"
+    let lastSaid = "no account answered"
+    for (let attempt = 0; attempt < 32 && Date.now() < deadline; attempt++) {
+      const exclude = new Set([...tried, ...unfit])
+      if (pool.pending(exclude) === 0) break
       let slot
       try {
-        slot = await pool.acquire({ exclude: new Set([...tried, ...unfit]) })
+        slot = await pool.acquire({ exclude })
       } catch (e) {
         const kind = e instanceof PoolError ? e.kind : "other"
-        return fail(res, STATUS_FOR[kind] || 503, e.message, "upstream_error")
+        const late = kind === "busy" && tried.size ? "spent" : kind
+        return fail(res, STATUS_FOR[late] || 503, late === "spent" ? lastSaid : e.message, "upstream_error")
       }
       const { target, release } = slot
-      tried.add(target)
       const seed = createHash("sha256").update(JSON.stringify(body.messages.slice(0, 1))).digest("hex").slice(0, 32)
       const sessionId = sessionOf(seed, target.device)
       const served = modelFor(target, want) || want
@@ -339,6 +367,9 @@ export function createGateway({ pool, token = "", defaultMaxTokens = 4096, log =
         ;({ up, ctype } = await oneTry({ target, body: served === body.model ? body : { ...body, model: served }, sessionId }))
       } catch (e) {
         release()
+        tried.add(target)
+        lastSaid = "the vendor did not answer: " + e.message
+        lastKind = /cancelled/.test(e.message) ? "aborted" : "timeout"
         log(target.label + ": " + e.message)
         continue
       }
@@ -367,12 +398,21 @@ export function createGateway({ pool, token = "", defaultMaxTokens = 4096, log =
       const code = j && typeof j.code === "number" ? j.code : 0
       pool.note(target, { status: up.status, code, text })
       const kind = kindOf(up.status, code)
-      if (kind === "edge") return fail(res, 503, saidOf(j, text), "upstream_error", code || up.status)
-      if (kind === "busy" || kind === "rate" || kind === "spent" || kind === "risk" || kind === "auth") continue
-      if (attempt < 2) continue
-      return fail(res, STATUS_FOR[kind] || 502, saidOf(j, text), "upstream_error", code || up.status)
+      lastSaid = saidOf(j, text)
+      lastKind = kind
+      if (kind === "edge") return fail(res, 503, lastSaid, "upstream_error", code || up.status)
+      if (kind === "busy" || kind === "rate") {
+        await sleep(busyWaits[Math.min(attempt, busyWaits.length - 1)] || 2000)
+        continue
+      }
+      tried.add(target)
     }
-    return fail(res, 502, "no account answered", "upstream_error")
+    return fail(
+      res,
+      STATUS_FOR[lastKind] || 502,
+      lastSaid,
+      lastKind === "spent" ? "insufficient_quota" : lastKind === "busy" || lastKind === "rate" ? "rate_limit_error" : "upstream_error",
+    )
   }
 
   const server = createServer(async (req, res) => {

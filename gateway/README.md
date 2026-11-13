@@ -63,13 +63,32 @@ serves is refused with `400 model_not_found` before anything is sent. `GET
 
 ## How a request is placed
 
-Per account: at most `--inflight` (3) requests at once and `--rpm` (12) starts a
-minute per address. A request that finds no slot waits up to `--queue-ms`
-(120 s) and is then answered `429` rather than left hanging.
+Per account: **one request at a time**, starts spaced by 800 ms, and `--rpm` (12)
+starts a minute per address. A request that finds no slot waits up to
+`--queue-ms` (120 s) and is then answered `429` rather than left hanging.
+
+That number is measured, not assumed. `../probe` fired requests 1.2 s apart on a
+live Start Plan (23:00, *ZCODE WEEKEND BUILD*) and recorded this timeline:
+
+```
+i=0  ok   (1222 ms)
+i=1  ok   (1200 → 4635 ms)      ← still running
+i=2  busy (153 ms, code 3008)   ← refused while i=1 ran
+i=3  busy (130 ms, code 3008)
+i=4  ok   (859 ms)              ← i=1 had finished
+i=5  ok   (1247 ms)
+```
+
+Nothing overlapped without a 3008, and a 3008 arrives in ~150 ms — before any
+answer starts, so it is an admission refusal, not a slow one. The plugin ships
+`maxConcurrency: 3`, but that is its own client-side gate: it admits three and
+then answers each 3008 by waiting a second and asking again, which is why its log
+reads "up to ~10 in flight against a cap of about three". Spacing the starts is
+what makes a queue look like three at once.
 
 | the vendor said | the pool does | the client sees |
 | --- | --- | --- |
-| 3008 / 3009 / 3010 (busy) | re-asks after 1 s, then 2 s; two refusals in a row narrow that account's gate for 5 min; five in a minute rest it for 3 min | the next account, else 429 |
+| 3008 / 3009 / 3010 (busy) | waits 1 s, then 2 s, and asks the **same** account again (it said "not this instant", not "no"); five in a minute rest it for 3 min | the next account if one is free, else 429 |
 | 1005 / 1113 (spent, no plan) | rests that account for 10 min | the next account, else 402 |
 | 1302 / 1303 / 3002, or 429 (rate) | rests it 2 min | the next account, else 429 |
 | 3012 (risk) | rests it 5 min | the next account, else 403 |
@@ -84,8 +103,9 @@ a spent plan.
 
 - **One address.** Every account leaves through this machine's IP. The vendor's
   concurrency cap is per account; the firewall's is per address, and it refuses
-  the whole address (405 for one to two hours) when the traffic looks wrong. Two
-  accounts at 3 in flight is the honest ceiling — see `../probe`.
+  the whole address (405 for one to two hours) when the traffic looks wrong. With
+  one request per account in flight, five planned accounts are five at once — the
+  number that matters is how many accounts have a plan, not `--inflight`.
 - **Not in the app.** This is a CLI beside the app, not a panel inside it. The
   Rust integration (menu entry, start/stop, a copyable base URL) is next.
 - **Nothing is invented for a plan we have no key for.** An account with no Start
