@@ -63,3 +63,14 @@ iana-time-zone = "0.1"
 [profile.release]
 strip = "symbols"
 lto = "thin"
+
+# --- 构建产物体积控制 ---
+# 2026-11 实测：一次正常开发后 target/debug 涨到 8.16 GB，其中
+# .rlib 2.26 GB / .lib 2.16 GB / .pdb 1.54 GB / .o 0.85 GB / .rmeta 0.79 GB / incremental 1.11 GB，
+# 大头是依赖 crate 的调试信息。依赖不需要调试信息（要断点的是本仓库的代码），
+# 自己的 crate 只保留行号表，栈回溯与 file:line 照样准确。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
