@@ -1,5 +1,18 @@
 # 更新日志
 
+## v1.8.0-Z.EMAIL（2026-11-14）
+
+### 新增：本地反代（测试版，OpenAI / Anthropic 双协议）
+
+- **开箱即用的本机网关**：设置页新增 GATEWAY 卡片，一键开关即可在 `127.0.0.1:8794` 起一个 OpenAI 兼容端点（`POST /v1/chat/completions`、`GET /v1/models`、`GET /healthz`），同时提供 Anthropic 原生透传（`POST /v1/messages`，含 SSE）。桌面端与 CLI 共用同一令牌（`~/.zcode-switch/gateway.json`）。
+- **账号池按套餐路由**：读取本机所有已保存账号，按套餐自动挑选能服务当前模型的账号；模型名大小写不敏感，并按套餐自己的写法（`GLM-5.3-Flash` / `GLM-5.3`）转发；没有任何套餐能服务该模型时直接回 400 `model_not_found` 并列出可用模型，不浪费一次请求。同一账号以多个名字保存时按 JWT `sub` 去重成一个 target。
+- **并发按实测收敛**：单账号同时只跑一个请求。压测工具（`probe/`，阶梯 + 错峰两种手法）显示：每个并发档位都只有 1 个请求成功，其余在 137–186ms 内回 `3008`；错峰 1.2s 时成功与「账号空闲」严格对齐。因此账号池为「一账号一席位 + 800ms 起步间隔」，繁忙错误 1s / 2s 后重问同一账号，队列上限 120s。
+- **地址级保护**：遇到 405（边缘防火墙）整池休息 180s、`3012` 风险码休息 300s、鉴权失败休息 600s；只有全部套餐确实用尽才回 402 `insufficient_quota`，其余情况回 429 并说明原因。
+- **CLI**：`--cli gateway status | start [--port <port>] | stop`。
+- **已知限制**：每次请求按 ZCode 客户端装帧（3 段 system + metadata），多消耗约 1073 个 prompt token；思考模型会先花 `max_tokens` 预算在 `reasoning_content` 上，因此 `max_tokens` 很小时可能只返回思考、正文为空。
+
+---
+
 ## v1.7.5-Z.EMAIL（2026-11-04）
 
 ### 新增：macOS 原生 Liquid Glass 界面（感谢 [@245678000000](https://github.com/245678000000)）
