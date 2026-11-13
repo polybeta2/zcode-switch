@@ -250,6 +250,7 @@ export const sseText = (obj) => "data: " + (typeof obj === "string" ? obj : JSON
 export class StreamTranslator {
   constructor({ model, id, created = Math.floor(Date.now() / 1000) }) {
     this.model = model
+    this.named = Boolean(model)
     this.id = id || "chatcmpl-" + Math.random().toString(36).slice(2, 12)
     this.created = created
     this.buffer = ""
@@ -304,7 +305,7 @@ export class StreamTranslator {
     if (name === "message_start") {
       const message = j.message || {}
       if (message.id) this.id = message.id
-      if (message.model) this.model = message.model
+      if (!this.named && message.model) this.model = message.model
       if (message.usage) this.usage = message.usage
       this.started = true
       out.push(this.chunk({ role: "assistant", content: "" }))

@@ -52,6 +52,22 @@ const PLANS = {
 // OS's) — either would only earn an empty-bodied 401.
 const usableKey = (k) => typeof k === "string" && k.trim().length > 20 && !/^enc:v\d/.test(k)
 
+// jwtSubject is the ZCode user a key belongs to. The app saves the same sign-in
+// under several names, each with its own freshly minted JWT, so the key string
+// cannot tell them apart — but the token's subject can, and one account must not
+// be handed out as several: the vendor's concurrency cap is per account, and the
+// firewall's is per address.
+export function jwtSubject(key) {
+  const parts = typeof key === "string" ? key.split(".") : []
+  if (parts.length !== 3) return ""
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"))
+    return String(payload.sub || payload.user_id || "")
+  } catch {
+    return ""
+  }
+}
+
 // targetsFromConfig reads one ZCode config.json the way the app does: every
 // provider entry with a key in it is a target, and the entry's own baseURL is
 // where it goes.
@@ -81,6 +97,8 @@ export function targetsFromConfig(config, { accountId, accountName, device }) {
       key: key.trim(),
       base,
       models,
+      subject: jwtSubject(key.trim()),
+      aliases: [],
       device: device || "",
       label: accountName + " · " + known.plan + (known.plan === "start" ? "" : " (" + providerId.replace("builtin:", "") + ")"),
     })
@@ -141,7 +159,19 @@ export function loadTargets({ includeLive = true, plans = null, accounts = null 
   const wanted = plans && plans.length ? new Set(plans) : null
   const kept = all.filter((t) => !wanted || wanted.has(t.plan))
   kept.sort((x, y) => x.rank - y.rank || Number(y.enabled) - Number(x.enabled) || x.accountName.localeCompare(y.accountName))
-  return kept
+  // one account, one target: aliases of a saved sign-in share a subject, so the
+  // first of them keeps the slot and remembers who else was folded into it
+  const byIdentity = new Map()
+  for (const t of kept) {
+    const identity = t.subject ? "sub:" + t.subject : "key:" + t.key
+    const first = byIdentity.get(identity)
+    if (first) {
+      first.aliases.push(t.accountName)
+      continue
+    }
+    byIdentity.set(identity, t)
+  }
+  return [...byIdentity.values()]
 }
 
 // readModels is the model list ZCode's own provider config knows, for

@@ -14,7 +14,8 @@
 // probe/results/run-*.jsonl and a summary to run-*.md.
 import { parseArgs } from "node:util"
 import { fileURLToPath } from "node:url"
-import { readSignIn, describeSignIn, zcodeDir } from "./lib/creds.mjs"
+import { readSignIn, describeSignIn, zcodeDir, jwtInfo } from "./lib/creds.mjs"
+import { loadTargets } from "../gateway/accounts.mjs"
 import { loadReference, buildStartPlanRequest, redacted, defaultRefPath } from "./lib/wire.mjs"
 import { fireOne, openRun, summarizeCounts, countsLine, formatTable } from "./lib/report.mjs"
 
@@ -36,6 +37,7 @@ const HELP = `probe.mjs — ZCode Start Plan behaviour probe
   --app-version 3.17.2   X-ZCode-App-Version
   --ref <path>           packages/zcode/index.mjs (default ../../_ref/...)
   --dir <path>           the zcode v2 folder to read (default ~/.zcode/v2)
+  --account <name|id>    measure one account this app saved, not the live sign-in
   --out <dir>            where results go (default probe/results)
   --stream               ask for stream:true
   --json                 print the raw result records too
@@ -68,6 +70,7 @@ async function main() {
       out: { type: "string", default: "" },
       rate: { type: "string", default: "12" },
       minutes: { type: "string", default: "4" },
+      account: { type: "string", default: "" },
       check: { type: "boolean", default: false },
       plan: { type: "boolean", default: false },
       "skip-preflight": { type: "boolean", default: false },
@@ -87,6 +90,33 @@ async function main() {
     signIn = readSignIn(v.dir || zcodeDir())
   } catch (e) {
     bail("cannot read the ZCode sign-in: " + e.message)
+  }
+  // --account measures a plan the app saved, which is the only way to probe one
+  // whose plan has started while the live sign-in is still on an account that
+  // has none. It reads the same store the gateway reads, so both see one set.
+  if (v.account) {
+    const targets = loadTargets({ includeLive: false, plans: ["start"] })
+    const hit = targets.find((t) => t.accountId === v.account || t.accountName === v.account || t.accountName.startsWith(v.account))
+    if (!hit) {
+      bail(
+        "no saved Start Plan account matches " + JSON.stringify(v.account) + "\nsaved: " +
+          (targets.map((t) => t.accountName).join(", ") || "(none)"),
+      )
+    }
+    signIn = {
+      dir: "account " + hit.accountId,
+      credPath: "",
+      cfgPath: "",
+      jwt: hit.key,
+      source: "saved account \"" + hit.accountName + "\" (v" + hit.plan + ")",
+      base: hit.base,
+      enabled: hit.enabled,
+      device: hit.device,
+      signIn: jwtInfo(hit.key),
+      activeProvider: hit.providerId,
+      codingPlanKeys: 0,
+      models: hit.models,
+    }
   }
   const level = v["app-version"] || ""
   const known = { jwt: signIn.jwt, device: signIn.device }

@@ -13,6 +13,10 @@ import { once } from "node:events"
 import { Pool } from "../pool.mjs"
 import { createGateway, kindOf } from "../server.mjs"
 import { StreamTranslator, finishReason, toAnthropic, toOpenAI } from "../translate.mjs"
+import { jwtSubject, loadTargets } from "../accounts.mjs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 // waitFor listens on an ephemeral port and resolves the base URL and the
 // server, so tests never fight over 8787.
@@ -345,6 +349,59 @@ test("a model no plan serves is refused before a request is spent", async (t) =>
   assert.match(j.error.message, /GLM-5\.3-Flash/)
   // nothing was sent: a wrong name costs a request, and requests are the scarce thing
   assert.equal(plan.seen.length, 0)
+})
+
+// jwt makes a token shaped like the plan's: three parts, the subject in the
+// middle one, and a signature nobody checks here.
+const jwt = (sub, salt = "a") =>
+  "eyJhbGciOiJIUzI1NiJ9." +
+  Buffer.from(JSON.stringify({ sub, user_id: sub, iat: 1, salt })).toString("base64url") +
+  ".c2lnbmF0dXJl"
+
+test("one ZCode account saved under several names is one target", async (t) => {
+  // the app saves a sign-in again with a fresh token, so the same account
+  // appears under two names with two different keys; counting it twice would
+  // let the pool run twice the traffic the account's cap allows
+  const dir = mkdtempSync(join(tmpdir(), "zsg-store-"))
+  const accounts = join(dir, "accounts")
+  mkdirSync(accounts, { recursive: true })
+  const save = (id, name, token) =>
+    writeFileSync(
+      join(accounts, id + ".json"),
+      JSON.stringify({
+        id,
+        name,
+        updated_at: "2026-11-13T00:00:00Z",
+        virtual_device_mid: "device-" + id,
+        config: {
+          provider: {
+            "builtin:zai-start-plan": {
+              enabled: true,
+              models: { "GLM-5.3-Flash": {} },
+              options: { apiKey: token, baseURL: "https://zcode.z.ai/api/v1/zcode-plan/anthropic" },
+            },
+          },
+        },
+      }),
+    )
+  save("a1", "first name", jwt("user-1", "one"))
+  save("a2", "second name", jwt("user-1", "two"))
+  save("a3", "other user", jwt("user-2"))
+  process.env.ZCODE_SWITCH_STORE_DIR = dir
+  t.after(() => {
+    delete process.env.ZCODE_SWITCH_STORE_DIR
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  assert.equal(jwtSubject(jwt("user-9")), "user-9")
+  assert.equal(jwtSubject("enc:v2:os:sealed"), "")
+
+  const targets = loadTargets({ includeLive: false })
+  assert.equal(targets.length, 2)
+  const folded = targets.find((x) => x.subject === "user-1")
+  assert.equal(folded.aliases.length, 1)
+  // the kept one is the first after sorting, and it remembers the other name
+  assert.ok([folded.accountName, folded.aliases[0]].includes("first name"))
 })
 
 test("the token is required, and /healthz is not behind it", async (t) => {

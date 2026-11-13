@@ -98,7 +98,7 @@ function loadToken(opts) {
 function printList(targets) {
   const rows = targets.map((t, i) => [
     String(i + 1),
-    t.accountName,
+    t.accountName + (t.aliases && t.aliases.length ? " +" + t.aliases.length : ""),
     t.plan,
     t.dress ? "dressed" : "plain",
     (Array.isArray(t.models) && t.models.length ? t.models.join(",") : "any").slice(0, 30),
