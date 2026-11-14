@@ -6,9 +6,12 @@ import { init, t, lang, stripErr } from "./i18n.js";
 import { IS_MAC, initGlass } from "./glass.js";
 
 const $app = document.getElementById("app");
+const LOCAL_HOSTS = ["127.0.0.1", "localhost", "::1"];
 let state = null;
 let autostart = false;
 let gateway = null;
+// 监听地址是否对外：只看后端回头给的 host，0.0.0.0 / :: 才算开放给 WSL 与局域网
+let lanOpen = false;
 let busy = false;
 let appVer = "";
 
@@ -16,6 +19,7 @@ async function refresh() {
   state = await invoke("get_state");
   autostart = await invoke("autostart_status").catch(() => false);
   gateway = await invoke("gateway_status").catch(() => null);
+  lanOpen = !!gateway && !LOCAL_HOSTS.includes(gateway.host || "");
   if (state?.language) init(state.language);
 }
 
@@ -163,11 +167,34 @@ const actions = {
     busy = true;
     try {
       const on = !(gateway && gateway.running);
-      gateway = on ? await invoke("gateway_start", { port: null }) : await invoke("gateway_stop");
+      // host 明着传：勾了「允许 WSL / 局域网」就是 0.0.0.0，否则只钉在本机
+      const host = lanOpen ? "0.0.0.0" : "127.0.0.1";
+      gateway = on ? await invoke("gateway_start", { port: null, host }) : await invoke("gateway_stop");
       render();
       toast(on ? t("s.gatewayOn") : t("s.gatewayOff"), "ok", gateway.base || "");
     } catch (e) {
       toast(t("s.gatewayToggle"), "bad", String(e));
+    } finally {
+      busy = false;
+    }
+  },
+
+  // 「允许 WSL / 局域网访问」：网关在跑就按新地址重开一次（后端 start() 见到已在跑会直接返回旧状态，所以先 stop）；
+  // 没跑就只记这个选择，等下一次开 GATEWAY 时一起生效。
+  async toggleLan() {
+    if (busy) return;
+    busy = true;
+    try {
+      const next = !lanOpen;
+      if (gateway && gateway.running) {
+        await invoke("gateway_stop");
+        gateway = await invoke("gateway_start", { port: null, host: next ? "0.0.0.0" : "127.0.0.1" });
+      }
+      lanOpen = next;
+      render();
+      toast(next ? t("s.gatewayLanOn") : t("s.gatewayLanOff"), "ok", (gateway && gateway.base) || "");
+    } catch (e) {
+      toast(t("s.gatewayLan"), "bad", stripErr(e));
     } finally {
       busy = false;
     }
@@ -266,6 +293,7 @@ function render() {
       </div>
       <label style="margin-top:14px">${t("s.gatewayLabel")}</label>
       ${toggle(gateway && gateway.running, "actions.toggleGateway()", t("s.gatewayToggle"), t("s.gatewayToggleDesc"))}
+      ${toggle(lanOpen, "actions.toggleLan()", t("s.gatewayLan"), t("s.gatewayLanDesc"))}
       <div class="path-line" style="margin-top:6px">
         <input class="zcode-path" type="text" readonly value="${esc((gateway && gateway.base) || "")}" />
         <button class="btn-ghost" click="actions.copyGateway()">${t("s.gatewayCopy")}</button>
@@ -331,6 +359,7 @@ function renderMac(s) {
       <div class="s-group-label">${t("s.gatewayLabel")}</div>
       <div class="s-group s-pad">
         ${toggle(gateway && gateway.running, "actions.toggleGateway()", t("s.gatewayToggle"), t("s.gatewayToggleDesc"))}
+        ${toggle(lanOpen, "actions.toggleLan()", t("s.gatewayLan"), t("s.gatewayLanDesc"))}
         <div class="path-line" style="margin-top:6px">
           <input class="zcode-path" type="text" readonly value="${esc((gateway && gateway.base) || "")}" />
           <button class="btn-ghost" click="actions.copyGateway()">${t("s.gatewayCopy")}</button>

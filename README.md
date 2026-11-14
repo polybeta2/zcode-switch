@@ -31,7 +31,8 @@ Tauri 2 桌面工具：在多个 ZCode 账号之间一键切换，自动显示�
 
 - 端点：`GET /v1/models`、`POST /v1/chat/completions`（OpenAI 格式）、`POST /v1/messages`（Anthropic 格式，原样透传）、`GET /healthz`（每个账号的套餐与今日收发）
 - 模型名按套餐自己的写法：`GLM-5.3-Flash`（客户端要别的名字会被拒；Start Plan 实测只有 Flash 能用，`GLM-5.3` 一律 402）
-- 只监听回环地址，端口固定 8794（被占用就直接报错，不会偷偷漂到别的端口）；鉴权用网关自己签发的 API Key：`Authorization: Bearer <API Key>`，首次启动自动生成，存于 `~/.zcode-switch/gateway.json`
+- 默认只监听回环地址 `127.0.0.1`，端口固定 8794（被占用就直接报错，不会偷偷漂到别的端口）；鉴权用网关自己签发的 API Key：`Authorization: Bearer <API Key>`，首次启动自动生成，存于 `~/.zcode-switch/gateway.json`
+- 要给 WSL2 或局域网里的程序用时，在设置页 GATEWAY 里勾 **「允许 WSL / 局域网访问」**（等价于 CLI 的 `--host 0.0.0.0`），并先在 Windows 防火墙放行 8794 入站（若 exe 首次监听时在弹窗上点过「取消」，会留下针对公用网络的程序级阻止规则，需要删掉——`Get-NetFirewallRule -DisplayName zcode-switch` 看 `Action=Block` 的两条）。WSL2 是 NAT 网络，连不到主机的 `127.0.0.1`，要用 `<Windows 网卡 IP>:8794`（`ip route show default` 里的网关地址）。host 写错（例如 `0.0.0.0:8794`）会被直接拒绝；配置文件里的 host 不合法时一律回落到 `127.0.0.1`，不会因为打错字就悄悄对外开放
 - 并发：一个账号同一时刻只发一条请求（实测 Start Plan 的上限就是 1，不是 3），账号之间并行；同一账号两次开始至少间隔 800ms
 - 重试：`3008`/`3009`/`3010`（并发）不换账号，等 1~2 秒再问同一个账号；`1005`/`1113`（没套餐/没额度）才换账号；整条 IP 被拒（405）时全部暂停 3 分钟
 - 静默重试：上游 200 之后立刻断流（Start Plan 优先度低，常见）时，只要客户端还一个字节都没收到就换账号重来，最多等到排队期限（120 秒）——客户端看到的只是这一轮慢一点，而不是「本轮运行失败」
@@ -52,7 +53,7 @@ zcode-switch.exe --cli export --id <id> --out <a.zsb>
 zcode-switch.exe --cli export-all --out <all.zsb>
 zcode-switch.exe --cli import --file <file.zsb>
 zcode-switch.exe --cli rename|delete|update|behavior|setpath|launch
-zcode-switch.exe --cli gateway status|start [--port <port>] [--inflight N] [--rpm N]|stop|limits [--inflight N] [--rpm N]
+zcode-switch.exe --cli gateway status|start [--port <port>] [--host <ip>] [--inflight N] [--rpm N]|stop|limits [--inflight N] [--rpm N]
 zcode-switch.exe --cli --lang en state              # 英文输出（--lang 空格传值、可置于任意位置；默认跟 GUI 语言/系统语言）
 ```
 

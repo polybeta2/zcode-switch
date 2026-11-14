@@ -1,5 +1,17 @@
 # 更新日志
 
+## v1.8.4-Z.EMAIL（2026-11-14）
+
+### 新增：反代可以给 WSL2 / 局域网用了（`--host`）
+
+- **以前只绑 `127.0.0.1`**：WSL2 走 NAT，访问不到主机的回环地址，里面的程序（比如 ARTEX）就使不上这个反代。现在设置页 GATEWAY 里多一个 **「允许 WSL / 局域网访问」** 开关（命令行等价于 `gateway start --host 0.0.0.0`），打开即从 `127.0.0.1` 换成 `0.0.0.0`，关掉就退回本机；网关正在跑时切换会按新地址自动重启一次，界面从后端回读的 `host` 显示当前状态，默认仍是 `127.0.0.1`。
+- **host 会落盘并校验**：写进 `~/.zcode-switch/gateway.json`，下次开关网关继续生效；不是合法 IP（比如把端口也写进去的 `0.0.0.0:8794`）会直接报错，配置文件里存了非法值则回落到 `127.0.0.1`——宁可连不上，也不能因为打错字把接口裸露到网络上。
+- `/healthz` 与 `gateway status` 多一个 `host` 字段，能看出这个实例到底听了哪个地址。
+- **别忘了防火墙**：Windows 的入站规则是按程序放的，换一次版本 exe 名字就变；稳妥的做法是按端口放行（`netsh advfirewall firewall add rule name="ZCode gateway" dir=in action=allow protocol=TCP localport=8794 remoteip=172.16.0.0/12`），把来源限制在 WSL / 内网网段。
+- **防火墙弹窗点过「取消」会留下阻止规则**：exe 第一次监听 0.0.0.0 时 Windows 会弹「是否允许」，点取消会生成同名的程序级 **Block** 规则（只作用于「公用网络」）。`vEthernet (WSL)` 没有网络配置文件、按公用网络算，而 Windows 里 **Block 优先于 Allow**——于是端口规则放行了也照样超时。排查：`Get-NetFirewallRule -DisplayName zcode-switch`（需管理员），删掉 `Action=Block` 那两条后立刻恢复（实测从 SYN 超时变成 200 / 40ms）。
+
+---
+
 ## v1.8.3-Z.EMAIL（2026-11-14）
 
 ### 修复：Start Plan 断流不再把错误丢给客户端（静默重试）

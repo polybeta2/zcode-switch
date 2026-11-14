@@ -464,6 +464,8 @@ pub fn run(args: &[String]) -> (String, i32) {
                 }
                 "start" => {
                     let port = flag(rest, "--port").and_then(|p| p.parse::<u16>().ok());
+                    // 监听地址：默认只听回环；WSL2 是独立子网，要让它连进来得写 0.0.0.0
+                    let host = flag(rest, "--host");
                     // 并发和每分钟预算：给了就写进 gateway.json，以后每次启动都照这个跑
                     let inflight = flag(rest, "--inflight").and_then(|v| v.parse::<u32>().ok());
                     let rpm = flag(rest, "--rpm").and_then(|v| v.parse::<u32>().ok());
@@ -474,13 +476,20 @@ pub fn run(args: &[String]) -> (String, i32) {
                         Ok(r) => r,
                         Err(e) => return (err(&e.to_string()), 1),
                     };
-                    let started = match rt.block_on(crate::gateway::start(paths.clone(), port)) {
+                    let started = match rt.block_on(crate::gateway::start(paths.clone(), port, host)) {
                         Ok(v) => v,
                         Err(e) => return (err(&e), 1),
                     };
                     println!("{}", ok(started.clone()));
                     let base = started.get("base").and_then(|b| b.as_str()).unwrap_or("");
+                    let host = started.get("host").and_then(|b| b.as_str()).unwrap_or("127.0.0.1");
+                    let port = started.get("port").and_then(|p| p.as_u64()).unwrap_or(0);
                     eprintln!("serving on {base} — Ctrl+C to stop");
+                    if host != "127.0.0.1" {
+                        eprintln!(
+                            "listening on {host}:{port} too — WSL/LAN clients use http://<这块网卡的IP>:{port}/v1（记得放行防火墙）"
+                        );
+                    }
                     // 前台跑到 Ctrl+C：CLI 起的网关活在这个进程里，进程没了网关就没了
                     let _ = rt.block_on(async {
                         let _ = tokio::signal::ctrl_c().await;

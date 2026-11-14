@@ -4,8 +4,14 @@
 // 这个端口对整台机器开放，任何本地进程都能连；一个留在磁盘上的随机串让「谁在用」
 // 是明确的，而不是「谁先连上算谁的」。
 //
-// token 存在 ~/.zcode-switch/gateway.json（造一次就不再变）；端口固定 127.0.0.1:8794，
+// token 存在 ~/.zcode-switch/gateway.json（造一次就不再变）；端口固定 8794，
 // 客户端把这条 base URL 写死才安全 —— 见下面 bind() 的注释，端口不能自己漂。
+//
+// 监听地址默认 127.0.0.1（本机客户端用）。WSL2 是独立子网，从里面连云主机的
+// 127.0.0.1 是连不到的：要让 WSL 里的工具用它，得在 gateway.json 写
+// "host": "0.0.0.0"（或 --cli gateway start --host 0.0.0.0），再按那块
+// vEthernet (WSL) 网卡的 IP 访问；防火墙记得放行该端口。
+
 /// paths_for_tests 只给集成测试用：从一个假 home 造出 Paths，不读进程环境也不碰真
 /// 账号目录。store 模块不对外，所以这里开一个小口子。
 #[doc(hidden)]
@@ -33,8 +39,11 @@ use crate::gateway::pool::{Opts, Pool};
 use crate::store::Paths;
 
 pub const DEFAULT_PORT: u16 = 8794;
+/// 只听回环；改 0.0.0.0 是显式选择（WSL / 局域网要连进来时）。
+pub const DEFAULT_HOST: &str = "127.0.0.1";
 
 struct Running {
+    host: String,
     port: u16,
     stop: Option<oneshot::Sender<()>>,
     started: Instant,
@@ -117,27 +126,44 @@ fn fixed_port() -> u16 {
     DEFAULT_PORT
 }
 
-fn bind(port: u16) -> Result<TcpListener, String> {
+/// bind_host 读 gateway.json 里的监听地址。只认 IP：写错一个字母就当没写，
+/// 悄悄退回回环——把一个打错的地址当成「对外开放」是更糟的默认。
+fn bind_host(paths: &Paths) -> String {
+    read_config(paths)
+        .get("host")
+        .and_then(|h| h.as_str())
+        .map(str::trim)
+        .filter(|h| h.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or(DEFAULT_HOST)
+        .to_string()
+}
+
+fn bind(host: &str, port: u16) -> Result<TcpListener, String> {
     // 端口就是客户端配置里写死的那个 base URL：占了就明说，不偷偷往后挪。
     // 曾经这里是「往后挪 10 个」，实测代价是：本地留了一个测试实例占着 8795，
     // 界面一开网关就静悄悄坐到 8796 并把 8796 写回 gateway.json，
     // 而 DSH 那边还连着 127.0.0.1:8794 —— 表现为「网关明明开着，却 connect-refused」。
-    TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+    TcpListener::bind((host, port)).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AddrInUse {
             format!(
-                "端口 {port} 已被占用：先关掉占用它的程序；或用 --port 换一个端口，并把客户端的 base URL 一起改掉"
+                "端口 {host}:{port} 已被占用：先关掉占用它的程序；或用 --port 换一个端口，并把客户端的 base URL 一起改掉"
             )
         } else {
-            format!("端口 {port} 无法绑定：{e}")
+            format!("端口 {host}:{port} 无法绑定：{e}")
         }
     })
 }
 
 pub fn status_of(paths: &Paths) -> Value {
     let guard = slot().lock().unwrap_or_else(|e| e.into_inner());
+    // base 永远是回环那条：本机客户端写死的就是它；监听地址另外报，方便 WSL 那边拼 URL
     let base = match guard.as_ref() {
         Some(r) => format!("http://127.0.0.1:{}/v1", r.port),
         None => format!("http://127.0.0.1:{}/v1", fixed_port()),
+    };
+    let host = match guard.as_ref() {
+        Some(r) => r.host.clone(),
+        None => bind_host(paths),
     };
     let targets = accounts::load_targets(paths, true, None, None);
     // 跑着的时候报告的是真的在用的那一对；没跑的时候报告下一次会用的那一对
@@ -152,6 +178,7 @@ pub fn status_of(paths: &Paths) -> Value {
         "running": guard.is_some(),
         "limits": { "inflight": inflight, "rpm": rpm },
         "port": guard.as_ref().map(|r| r.port).unwrap_or_else(fixed_port),
+        "host": host,
         "base": base,
         "token": token_for(paths),
         "uptime_s": guard.as_ref().map(|r| r.started.elapsed().as_secs()).unwrap_or(0),
@@ -161,7 +188,9 @@ pub fn status_of(paths: &Paths) -> Value {
 }
 
 /// start 起一个本地网关：端口只认 `--port` 或默认 8794，占了就报错，不往后挪。
-pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
+/// host 给了就写进 gateway.json 并照它监听（0.0.0.0 让 WSL/局域网也能连），
+/// 不给就用上一次存下的那个，默认还是 127.0.0.1。
+pub async fn start(paths: Paths, port: Option<u16>, host: Option<String>) -> Result<Value, String> {
     {
         let guard = slot().lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
@@ -170,7 +199,24 @@ pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
     }
     let token = token_for(&paths);
     let want = port.unwrap_or_else(fixed_port);
-    let listener = bind(want)?;
+    let want_host = match host {
+        Some(h) => {
+            let h = h.trim().to_string();
+            if h.parse::<std::net::IpAddr>().is_err() {
+                return Err(format!(
+                    "监听地址 {h} 不是合法的 IP（写 127.0.0.1 只听本机，写 0.0.0.0 让 WSL/局域网也能连）"
+                ));
+            }
+            let mut cfg = read_config(&paths);
+            if let Some(o) = cfg.as_object_mut() {
+                o.insert("host".into(), Value::String(h.clone()));
+            }
+            write_config(&paths, &cfg);
+            h
+        }
+        None => bind_host(&paths),
+    };
+    let listener = bind(&want_host, want)?;
     let actual = listener.local_addr().map(|a| a.port()).unwrap_or(want);
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
@@ -195,6 +241,7 @@ pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
     {
         let mut guard = slot().lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Running {
+            host: want_host.clone(),
             port: actual,
             stop: Some(tx),
             started: Instant::now(),
@@ -275,8 +322,8 @@ pub fn gateway_set_limits(inflight: Option<u32>, rpm: Option<u32>) -> Value {
 }
 
 #[tauri::command]
-pub async fn gateway_start(port: Option<u16>) -> Result<Value, String> {
-    start(Paths::detect(), port).await
+pub async fn gateway_start(port: Option<u16>, host: Option<String>) -> Result<Value, String> {
+    start(Paths::detect(), port, host).await
 }
 
 #[tauri::command]
