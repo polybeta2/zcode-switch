@@ -6,6 +6,13 @@
 //
 // token 存在 ~/.zcode-switch/gateway.json（造一次就不再变）；端口固定 127.0.0.1:8794，
 // 客户端把这条 base URL 写死才安全 —— 见下面 bind() 的注释，端口不能自己漂。
+/// paths_for_tests 只给集成测试用：从一个假 home 造出 Paths，不读进程环境也不碰真
+/// 账号目录。store 模块不对外，所以这里开一个小口子。
+#[doc(hidden)]
+pub fn paths_for_tests(home: std::path::PathBuf) -> crate::store::Paths {
+    crate::store::Paths { home: home.clone(), data_root: home }
+}
+
 pub mod accounts;
 pub mod dress;
 pub mod pool;

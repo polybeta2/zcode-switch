@@ -44,6 +44,10 @@ pub struct Opts {
     pub edge_ms: u64,
     pub risk_ms: u64,
     pub auth_ms: u64,
+    /// 上游开了口又立刻断流之后的冷却。断流多半是 start plan 被挤的，不是账号的错，
+    /// 一会儿就好；但连着重连同一个账号通常还是断，所以让它歇一下，换别人先顶上。
+    /// 这是「软休息」：所有人都这样时 acquire 会等它，而不是报「都在休息」。
+    pub broken_ms: u64,
     pub busy_waits: Vec<u64>,
 }
 
@@ -62,6 +66,7 @@ impl Default for Opts {
             edge_ms: 180_000,
             risk_ms: 300_000,
             auth_ms: 600_000,
+            broken_ms: 1_500,
             busy_waits: vec![1_000, 2_000],
         }
     }
@@ -249,6 +254,12 @@ impl Pool {
             }
             if let Some(until) = slot.rest_until {
                 if until > now {
+                    // broken 是软休息：断流几秒就过去了，把它算进「全体都歇着」会让只有
+                    // 一个账号的机器直接拿到 Rest 而报错。这里只记进 wake，等它到期。
+                    if slot.rest_kind == "broken" {
+                        wake = wake.min(until.duration_since(now));
+                        continue;
+                    }
                     rested += 1;
                     if reason.is_empty() {
                         reason = slot.rest_kind.to_string();
@@ -395,6 +406,10 @@ impl Pool {
             "auth" => {
                 slot.rest_until = Some(now + Duration::from_millis(o.auth_ms));
                 slot.rest_kind = "auth";
+            }
+            "broken" => {
+                slot.rest_until = Some(now + Duration::from_millis(o.broken_ms));
+                slot.rest_kind = "broken";
             }
             "risk" | "edge" => {
                 slot.rest_until = Some(now + Duration::from_millis(o.risk_ms));

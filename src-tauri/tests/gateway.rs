@@ -351,3 +351,38 @@ fn a_thinking_level_the_plans_cannot_honour_is_left_to_the_plan() {
     let (req, _) = gateway::translate::to_anthropic(&body, 1024).expect("translates");
     assert_eq!(req["output_config"]["effort"], "low");
 }
+
+/// 网关靠 saw_content 判断「这个流已经接上了」：只有角色那一帧不算——上游 200 之后
+/// 只报了个开场就断掉，换账号完全来得及。
+#[test]
+fn a_role_frame_alone_is_not_content() {
+    let mut tr = gateway::translate::StreamTranslator::new("GLM-5.3-Flash", None, 1_700_000_000);
+    tr.feed("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":3}}}\n\n");
+    assert!(!tr.saw_content(), "the opening frame counted as content");
+    tr.feed("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+    assert!(!tr.saw_content(), "an empty block counted as content");
+    tr.feed("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n");
+    assert!(tr.saw_content(), "a text delta did not count as content");
+}
+
+/// 断流是「软休息」：只有这一个账号时 acquire 必须等它，而不是直接回 Rest——否则单账号
+/// 的机器一遇到 start plan 被挤就整轮失败，静默重试等于没有。
+#[test]
+fn a_broken_stream_rests_the_account_softly_enough_to_retry_it() {
+    use gateway::pool::{Opts, Pool, Ready};
+    let pool = Pool::new(Opts { inflight: 1, start_gap_ms: 0, broken_ms: 30, ..Default::default() });
+    let targets = vec![target("a", "k1")];
+    let none: HashSet<String> = HashSet::new();
+    match pool.acquire(&targets, &none) {
+        Ready::Lease(l) => drop(l),
+        _ => panic!("the first seat was not handed out"),
+    }
+    pool.note("k1", "broken");
+    match pool.acquire(&targets, &none) {
+        Ready::Wait(_) => {}
+        Ready::Rest(r) => panic!("a broken stream is a soft rest, got Rest({r})"),
+        Ready::Lease(_) => panic!("the account was retried with no pause at all"),
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert!(matches!(pool.acquire(&targets, &none), Ready::Lease(_)), "the account never came back");
+}

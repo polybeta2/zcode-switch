@@ -21,7 +21,11 @@ fn client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
+            // 这里刻意不设总超时：reqwest 的 timeout 连读响应体一起算，流式回答一旦说满
+            // 五分钟就会被我们自己掐断——客户端那边看到的就是 "error decoding response body"
+            // （DSH 里这么报过）。read_timeout 只在「连续这么多秒一个字节都没有」时断，
+            // 正常的长回答不受影响；真要卡死，也还有它兜着。
+            .read_timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(20))
             .user_agent("zcode-switch-gateway/0.1")
             .build()

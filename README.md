@@ -27,13 +27,14 @@ Tauri 2 桌面工具：在多个 ZCode 账号之间一键切换，自动显示�
 
 ## 本地反代（测试版）
 
-把本机已保存的 ZCode 账号变成一个 OpenAI 兼容的本地接口：`http://127.0.0.1:8794/v1`。设置页打开开关即可（会显示可复制的地址与 token），也可以走 CLI。
+把本机已保存的 ZCode 账号变成一个 OpenAI 兼容的本地接口：`http://127.0.0.1:8794/v1`。设置页打开开关即可（会显示可复制的地址与 API Key），也可以走 CLI。
 
 - 端点：`GET /v1/models`、`POST /v1/chat/completions`（OpenAI 格式）、`POST /v1/messages`（Anthropic 格式，原样透传）、`GET /healthz`（每个账号的套餐与今日收发）
-- 模型名按套餐自己的写法：`GLM-5.3-Flash`、`GLM-5.3`
-- 只监听回环地址，需要 Bearer token（首次启动自动生成，存于 `~/.zcode-switch/gateway.json`）
+- 模型名按套餐自己的写法：`GLM-5.3-Flash`（客户端要别的名字会被拒；Start Plan 实测只有 Flash 能用，`GLM-5.3` 一律 402）
+- 只监听回环地址，端口固定 8794（被占用就直接报错，不会偷偷漂到别的端口）；鉴权用网关自己签发的 API Key：`Authorization: Bearer <API Key>`，首次启动自动生成，存于 `~/.zcode-switch/gateway.json`
 - 并发：一个账号同一时刻只发一条请求（实测 Start Plan 的上限就是 1，不是 3），账号之间并行；同一账号两次开始至少间隔 800ms
 - 重试：`3008`/`3009`/`3010`（并发）不换账号，等 1~2 秒再问同一个账号；`1005`/`1113`（没套餐/没额度）才换账号；整条 IP 被拒（405）时全部暂停 3 分钟
+- 静默重试：上游 200 之后立刻断流（Start Plan 优先度低，常见）时，只要客户端还一个字节都没收到就换账号重来，最多等到排队期限（120 秒）——客户端看到的只是这一轮慢一点，而不是「本轮运行失败」
 - 请求外壳与 ZCode 客户端一致（3 段 system、会话 id、设备指纹），因此每条请求的 prompt 会多出约 1070 token
 
 已知限制：这是测试版；厂商侧有 IP 级风控，长期高频可能被 405 拦一段时间（应用会自己退避）；Start Plan 的登录 token 不会自动续期，过期需在 ZCode 里重新登录。
@@ -51,7 +52,7 @@ zcode-switch.exe --cli export --id <id> --out <a.zsb>
 zcode-switch.exe --cli export-all --out <all.zsb>
 zcode-switch.exe --cli import --file <file.zsb>
 zcode-switch.exe --cli rename|delete|update|behavior|setpath|launch
-zcode-switch.exe --cli gateway status|start [--port <port>]|stop
+zcode-switch.exe --cli gateway status|start [--port <port>] [--inflight N] [--rpm N]|stop|limits [--inflight N] [--rpm N]
 zcode-switch.exe --cli --lang en state              # 英文输出（--lang 空格传值、可置于任意位置；默认跟 GUI 语言/系统语言）
 ```
 

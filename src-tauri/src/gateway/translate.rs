@@ -549,6 +549,8 @@ pub struct StreamTranslator {
     finish: Option<String>,
     pub usage: Option<Value>,
     started: bool,
+    /// 见过真正的正文（文字、思考或工具参数）。网关靠它判断「这个流已经接上了」。
+    content: bool,
 }
 
 impl StreamTranslator {
@@ -565,7 +567,13 @@ impl StreamTranslator {
             finish: None,
             usage: None,
             started: false,
+            content: false,
         }
+    }
+
+    /// saw_content 是这个流是不是已经说过人话了。只有角色那一帧不算。
+    pub fn saw_content(&self) -> bool {
+        self.content
     }
 
     fn chunk(&self, delta: Value, finish_reason: Option<&str>, extra: Option<Value>) -> String {
@@ -658,6 +666,7 @@ impl StreamTranslator {
                         .map(String::from)
                         .unwrap_or_else(|| format!("call_{idx}"));
                     let nm = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    self.content = true;
                     return self.chunk(
                         json!({ "tool_calls": [{ "index": idx, "id": id, "type": "function", "function": { "name": nm, "arguments": "" } }] }),
                         None,
@@ -670,22 +679,31 @@ impl StreamTranslator {
                 let d = j.get("delta").cloned().unwrap_or(json!({}));
                 match d.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                     "text_delta" => match d.get("text").and_then(|t| t.as_str()) {
-                        Some(t) => self.chunk(json!({ "content": t }), None, None),
+                        Some(t) => {
+                            self.content = true;
+                            self.chunk(json!({ "content": t }), None, None)
+                        }
                         None => String::new(),
                     },
                     "thinking_delta" => match d.get("thinking").and_then(|t| t.as_str()) {
-                        Some(t) => self.chunk(json!({ "reasoning_content": t }), None, None),
+                        Some(t) => {
+                            self.content = true;
+                            self.chunk(json!({ "reasoning_content": t }), None, None)
+                        }
                         None => String::new(),
                     },
                     "input_json_delta" => {
                         let index = j.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
                         let idx = self.tool_index.get(&index).copied();
                         match (idx, d.get("partial_json").and_then(|p| p.as_str())) {
-                            (Some(idx), Some(pj)) => self.chunk(
-                                json!({ "tool_calls": [{ "index": idx, "function": { "arguments": pj } }] }),
-                                None,
-                                None,
-                            ),
+                            (Some(idx), Some(pj)) => {
+                                self.content = true;
+                                self.chunk(
+                                    json!({ "tool_calls": [{ "index": idx, "function": { "arguments": pj } }] }),
+                                    None,
+                                    None,
+                                )
+                            }
                             _ => String::new(),
                         }
                     }

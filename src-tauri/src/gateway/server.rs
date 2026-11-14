@@ -317,13 +317,18 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
     }
 
     let deadline = Instant::now() + Duration::from_millis(ctx.pool.opts.queue_ms);
-    let mut exclude: HashSet<String> = HashSet::new();
+    // 两本「先别问它」的名单。dead 是这一趟里它不会好了（没额度、鉴权、网络不通）；
+    // broken 是上游开了口又立刻断——同一批账号过一会儿可能就好了，所以它会被清空重来。
+    let mut dead: HashSet<String> = HashSet::new();
+    let mut broken: HashSet<String> = HashSet::new();
     let mut saw_spent = false;
     let mut last: (&'static str, String) = ("none", "no account answered".to_string());
     let mut attempt = 0usize;
     let mut busy_round = 0usize;
 
     while attempt < 32 && Instant::now() < deadline {
+        let mut exclude: HashSet<String> = dead.clone();
+        exclude.extend(broken.iter().cloned());
         let pick = match ctx.pool.acquire(&serving, &exclude) {
             Ready::Lease(l) => l,
             Ready::Wait(d) => {
@@ -343,36 +348,13 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
             }
         };
         attempt += 1;
-        let spelling = model_for(&target, &want).unwrap_or_else(|| want.clone());
-        let mut out = req.clone();
-        out["model"] = Value::String(spelling.clone());
-        let text = out.to_string();
-
-        // 会话 id 由「账号 + 这一段对话」决定：同一段对话里每一轮都相同，提示词缓存才落得住。
-        // 它不参与鉴权，只影响厂商那边的缓存命中。
-        let session = dress::session_of(&conversation_seed(&req, &target), &target.device);
-        let query = dress::query_of(&text, &session);
-        let body = if target.dress {
-            dress::dress(&text, target.site, &target.device, &session)
-        } else {
-            dress::marked(&text, &target.device, &session)
-        };
-        let payload: Value = serde_json::from_str(&body).unwrap_or(out);
-        let headers = if target.plan == "start" {
-            dress::start_headers(&target.key, &session, &query, &ctx.app_version)
-        } else {
-            dress::app_headers(&target.key, &target.device, &ctx.app_version)
-        };
-
-        let sent = upstream::post(&target.endpoint(), &headers, &payload).await;
-        let resp = match sent {
-            Ok(r) => r,
-            Err(e) => {
-                let kind = upstream::kind_of(&e);
+        let (resp, spelling) = match open_once(&req, &want, &target, &ctx.app_version).await {
+            Ok(v) => v,
+            Err((kind, message)) => {
                 ctx.pool.note(&target.key, kind);
-                last = (kind, format!("{e}"));
+                last = (kind, message);
                 if kind == "timeout" || kind == "net" {
-                    exclude.insert(target.key.clone());
+                    dead.insert(target.key.clone());
                 }
                 drop(pick);
                 continue;
@@ -387,12 +369,48 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
             .unwrap_or(false);
 
         if status == 200 && stream && streamed {
-            ctx.pool.note(&target.key, "ok");
-            return if speak_openai {
-                stream_openai(resp, &spelling, &target, pick)
+            let tr = if speak_openai {
+                Some(translate::StreamTranslator::new(&spelling, None, translate::now_secs()))
             } else {
-                stream_raw(resp, &target, pick)
+                None
             };
+            // 空着收尾也算断流：客户端一个字节都还没收到，换账号它看不见。
+            let rolled = match preroll(resp, tr).await {
+                Ok(head) if head.carried_payload() => Ok(head),
+                Ok(_) => Err("the vendor closed the stream before any content".to_string()),
+                Err(e) => Err(e),
+            };
+            match rolled {
+                Ok(head) => {
+                    ctx.pool.note(&target.key, "ok");
+                    return stream_of(head, &target, pick);
+                }
+                Err(why) => {
+                    // 一个字节都还没交给客户端：换账号重来，它那边什么都看不见。
+                    ctx.pool.note(&target.key, "broken");
+                    last = ("broken", why);
+                    broken.insert(target.key.clone());
+                    drop(pick);
+                    // 全都断过一遍？等一会儿把名单清掉再来一遍，直到排队的期限用完。
+                    // 这就是「静默重试」：客户端只会觉得这一轮慢。
+                    if serving.iter().all(|t| dead.contains(&t.key) || broken.contains(&t.key)) {
+                        let wait = ctx
+                            .pool
+                            .opts
+                            .busy_waits
+                            .get(busy_round.min(ctx.pool.opts.busy_waits.len().saturating_sub(1)))
+                            .copied()
+                            .unwrap_or(1_000);
+                        busy_round += 1;
+                        if busy_round > 3 || ctx.pool.pending(&serving, &dead) == 0 {
+                            break;
+                        }
+                        broken.clear();
+                        ctx.pool.wait(Duration::from_millis(wait)).await;
+                    }
+                    continue;
+                }
+            }
         }
         let reply = match upstream::read_text(resp, CAP).await {
             Ok(r) => r,
@@ -400,7 +418,7 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
                 let kind = upstream::kind_of(&e);
                 ctx.pool.note(&target.key, kind);
                 last = (kind, format!("{e}"));
-                exclude.insert(target.key.clone());
+                dead.insert(target.key.clone());
                 drop(pick);
                 continue;
             }
@@ -453,30 +471,64 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
                     .copied()
                     .unwrap_or(1_000);
                 busy_round += 1;
-                if ctx.pool.pending(&serving, &exclude) == 0 {
+                if ctx.pool.pending(&serving, &dead) == 0 {
                     break;
                 }
                 ctx.pool.wait(Duration::from_millis(wait)).await;
             }
             "spent" => {
                 saw_spent = true;
-                exclude.insert(target.key.clone());
+                dead.insert(target.key.clone());
             }
             _ => {
-                exclude.insert(target.key.clone());
+                dead.insert(target.key.clone());
             }
         }
-        if ctx.pool.pending(&serving, &exclude) == 0 {
+        if ctx.pool.pending(&serving, &dead) == 0 {
             break;
         }
     }
 
-    let (kind, message) = if saw_spent && matches!(last.0, "busy" | "rate" | "none") {
+    let (kind, message) = if saw_spent && matches!(last.0, "busy" | "rate" | "none" | "broken") {
         ("spent", message_of_spent(&last.1))
     } else {
         last
     };
     fail_kind(kind, &message)
+}
+
+/// open_once 准备并发出一次请求：把模型名换成套餐的拼写、穿衣服、带上会话 id。
+/// 失败时给 (kind, message)，由调用方决定换账号还是放弃。
+async fn open_once(
+    req: &Value,
+    want: &str,
+    target: &Target,
+    app_version: &str,
+) -> Result<(reqwest::Response, String), (&'static str, String)> {
+    let spelling = model_for(target, want).unwrap_or_else(|| want.to_string());
+    let mut out = req.clone();
+    out["model"] = Value::String(spelling.clone());
+    let text = out.to_string();
+
+    // 会话 id 由「账号 + 这一段对话」决定：同一段对话里每一轮都相同，提示词缓存才落得住。
+    // 它不参与鉴权，只影响厂商那边的缓存命中。
+    let session = dress::session_of(&conversation_seed(req, target), &target.device);
+    let query = dress::query_of(&text, &session);
+    let body = if target.dress {
+        dress::dress(&text, target.site, &target.device, &session)
+    } else {
+        dress::marked(&text, &target.device, &session)
+    };
+    let payload: Value = serde_json::from_str(&body).unwrap_or(out);
+    let headers = if target.plan == "start" {
+        dress::start_headers(&target.key, &session, &query, app_version)
+    } else {
+        dress::app_headers(&target.key, &target.device, app_version)
+    };
+    upstream::post(&target.endpoint(), &headers, &payload)
+        .await
+        .map(|r| (r, spelling))
+        .map_err(|e| (upstream::kind_of(&e), format!("{e}")))
 }
 
 fn message_of_spent(inner: &str) -> String {
@@ -536,50 +588,114 @@ fn sse(body: Body, target: &Target) -> Response {
     r
 }
 
-/// stream_openai 一边收厂商的事件一边翻成 OpenAI 的 chunk。座位（lease）跟着流走，
-/// 流结束才放——否则下一个请求会在上一个还在答的时候挤进来。
-fn stream_openai(
+/// Head 是 preroll 的成果：已经翻好的开头、（OpenAI 入口的）翻译器、还没读完的上游响应。
+struct Head {
+    prologue: Vec<u8>,
     resp: reqwest::Response,
-    spelling: &str,
-    target: &Target,
-    lease: crate::gateway::pool::Lease,
-) -> Response {
-    let tr = translate::StreamTranslator::new(spelling, None, translate::now_secs());
-    let state = (resp, tr, lease, false);
-    let stream = futures_util::stream::unfold(state, |(mut resp, mut tr, lease, done)| async move {
-        if done {
+    tr: Option<translate::StreamTranslator>,
+    /// 上游在 preroll 期间就收尾了：剩下的只有 prologue。
+    finished: bool,
+}
+
+impl Head {
+    /// carried_payload 说这个流的开头里有没有真正的内容。上游 200 之后正文一个字节都
+    /// 没给就收了尾，跟断流是一回事——这时客户端还没收到任何东西，换账号完全来得及。
+    fn carried_payload(&self) -> bool {
+        match self.tr.as_ref() {
+            Some(t) => t.saw_content(),
+            None => !self.prologue.is_empty(),
+        }
+    }
+}
+
+/// preroll 先替客户端把流的开头读下来，读到正文才交出去。
+///
+/// 起因是 start plan：它在智谱那边优先度最低，常见的是 200 之后立刻断流——客户端那边
+/// 显示 "error decoding response body"，一整轮白跑（DSH 里就是这么报的）。只要客户端
+/// 一个字节都还没收到，换账号重来它完全看不见，只会觉得这一轮慢一点。
+async fn preroll(mut resp: reqwest::Response, mut tr: Option<translate::StreamTranslator>) -> Result<Head, String> {
+    let mut prologue: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => match tr.as_mut() {
+                Some(t) => {
+                    prologue.extend_from_slice(t.feed(&String::from_utf8_lossy(&chunk)).as_bytes());
+                    // 第一段正文（文字、思考或工具参数）到了就算接上了：再往后换账号
+                    // 已经来不及——客户端那边已经有东西了。
+                    if t.saw_content() {
+                        return Ok(Head { prologue, resp, tr, finished: false });
+                    }
+                }
+                // Anthropic 入口是原样透传：第一批字节到了就算接上了
+                None => {
+                    prologue.extend_from_slice(&chunk);
+                    return Ok(Head { prologue, resp, tr, finished: false });
+                }
+            },
+            Ok(None) => {
+                if let Some(t) = tr.as_mut() {
+                    prologue.extend_from_slice(t.finish().as_bytes());
+                }
+                return Ok(Head { prologue, resp, tr, finished: true });
+            }
+            Err(e) => return Err(format!("{e}")),
+        }
+    }
+}
+
+/// stream_of 把 preroll 读下来的开头先交给客户端，后面的跟着上游走。座位（lease）跟着流走，
+/// 流结束才放——否则下一个请求会在上一个还在答的时候挤进来。
+fn stream_of(head: Head, target: &Target, lease: crate::gateway::pool::Lease) -> Response {
+    let state = (head, lease, false);
+    let stream = futures_util::stream::unfold(state, |(mut head, lease, mut done)| async move {
+        let _hold = &lease;
+        let p = std::mem::take(&mut head.prologue);
+        if !p.is_empty() {
+            return Some((Ok::<Vec<u8>, std::io::Error>(p), (head, lease, done)));
+        }
+        if done || head.finished {
             return None;
         }
         loop {
-            match resp.chunk().await {
+            match head.resp.chunk().await {
                 Ok(Some(chunk)) => {
                     let text = String::from_utf8_lossy(&chunk);
-                    let out = tr.feed(&text);
+                    let out = match head.tr.as_mut() {
+                        Some(t) => t.feed(&text),
+                        None => text.to_string(),
+                    };
                     if !out.is_empty() {
-                        return Some((Ok::<Vec<u8>, std::io::Error>(out.into_bytes()), (resp, tr, lease, false)));
+                        return Some((Ok(out.into_bytes()), (head, lease, done)));
                     }
                 }
                 Ok(None) => {
-                    let tail = tr.finish();
-                    return Some((Ok(tail.into_bytes()), (resp, tr, lease, true)));
+                    let tail = match head.tr.as_mut() {
+                        Some(t) => t.finish(),
+                        None => String::new(),
+                    };
+                    done = true;
+                    if tail.is_empty() {
+                        return None;
+                    }
+                    return Some((Ok(tail.into_bytes()), (head, lease, done)));
                 }
                 Err(e) => {
-                    let msg = translate::sse_text(&json!({
-                        "error": { "message": format!("the vendor's stream broke: {e}"), "type": "upstream_error" }
-                    }));
-                    return Some((Ok(msg.into_bytes()), (resp, tr, lease, true)));
+                    // 已经交给客户端了，换不了账号：把断在哪里说清楚。OpenAI 入口用事件说，
+                    // Anthropic 入口只能让流停掉。
+                    done = true;
+                    let msg = match head.tr.as_ref() {
+                        Some(_) => translate::sse_text(&json!({
+                            "error": { "message": format!("the vendor's stream broke: {e}"), "type": "upstream_error" }
+                        })),
+                        None => String::new(),
+                    };
+                    if msg.is_empty() {
+                        return None;
+                    }
+                    return Some((Ok(msg.into_bytes()), (head, lease, done)));
                 }
             }
         }
-    });
-    sse(Body::from_stream(stream), target)
-}
-
-/// stream_raw 是 Anthropic 入口用的一条：厂商说什么就转什么，字节不动。
-fn stream_raw(resp: reqwest::Response, target: &Target, lease: crate::gateway::pool::Lease) -> Response {
-    let stream = futures_util::StreamExt::map(resp.bytes_stream(), move |chunk| {
-        let _hold = &lease;
-        chunk.map_err(|e| std::io::Error::other(e.to_string()))
     });
     sse(Body::from_stream(stream), target)
 }

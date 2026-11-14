@@ -24,6 +24,9 @@ pub struct Route {
     pub path: &'static str,
     /// (status, extra headers, body)，按请求序消费，最后一条无限重复
     pub responses: Vec<(u16, Vec<(&'static str, &'static str)>, String)>,
+    /// 只写这么多字节就关连接，但 Content-Length 报的是完整长度——模拟「200 之后立刻
+    /// 断流」：start plan 被挤的时候就是这个样子。
+    pub cut: Option<usize>,
 }
 
 impl Route {
@@ -34,6 +37,7 @@ impl Route {
                 .into_iter()
                 .map(|(s, b)| (s, Vec::new(), b.to_string()))
                 .collect(),
+            cut: None,
         }
     }
     pub fn with_headers(
@@ -46,6 +50,22 @@ impl Route {
                 .into_iter()
                 .map(|(s, h, b)| (s, h, b.to_string()))
                 .collect(),
+            cut: None,
+        }
+    }
+    /// sse 是一次完整的流式回答；sse_cut 是开了口就断（只写 keep 个字节，长度照报）。
+    pub fn sse(path: &'static str, body: &str) -> Route {
+        Route {
+            path,
+            responses: vec![(200, vec![("Content-Type", "text/event-stream")], body.to_string())],
+            cut: None,
+        }
+    }
+    pub fn sse_cut(path: &'static str, body: &str, keep: usize) -> Route {
+        Route {
+            path,
+            responses: vec![(200, vec![("Content-Type", "text/event-stream")], body.to_string())],
+            cut: Some(keep),
         }
     }
 }
@@ -101,7 +121,10 @@ impl MockUpstream {
                         let c = serve_counters[i].fetch_add(1, Ordering::SeqCst);
                         let k = c.min(n - 1);
                         let (status, headers, body) = &route.responses[k];
-                        format_response(*status, headers, body)
+                        match route.cut {
+                            Some(keep) => format_response_cut(*status, headers, body, keep),
+                            None => format_response(*status, headers, body),
+                        }
                     }
                     None => format_response(404, &Vec::new(), r#"{"code":404,"msg":"mock no route"}"#),
                 };
@@ -187,12 +210,27 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, BTreeMap<St
 }
 
 fn format_response(status: u16, headers: &[(&'static str, &'static str)], body: &str) -> String {
-    let mut out = format!("HTTP/1.1 {status} MOCK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
+    // 路由自己给了 Content-Type（比如 text/event-stream）就照它的来，别再加一个默认的
+    // ——两个同名头会让客户端只看第一个，流式用例会误判成 JSON。
+    let named = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    let ctype = if named { "" } else { "Content-Type: application/json\r\n" };
+    let mut out = format!("HTTP/1.1 {status} MOCK\r\n{ctype}Content-Length: {}\r\nConnection: close\r\n", body.len());
     for (k, v) in headers {
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("\r\n");
     out.push_str(body);
+    out
+}
+
+/// 同样的头，但正文只写 keep 个字节就关连接（Content-Length 仍是完整长度）。
+/// 客户端读到一半连接就没了，reqwest 会报 "error decoding response body"——正是用户在
+/// DSH 里看到的那句。
+fn format_response_cut(status: u16, headers: &[(&'static str, &'static str)], body: &str, keep: usize) -> String {
+    let mut out = format_response(status, headers, body);
+    let keep = keep.min(body.len());
+    let head_len = out.len() - body.len();
+    out.truncate(head_len + keep);
     out
 }
 
