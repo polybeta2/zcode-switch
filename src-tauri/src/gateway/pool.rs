@@ -4,6 +4,15 @@
 // 所以这里的形状是「每账号一张座位表」，而不是一个计数器：座位空着才发，
 // 发出去立刻占座，请求结束（Lease 掉 Drop）才放座。
 //
+// 第二个实测事实（2026-11-14，10 个 start plan 账号）：并发上限不在账号上，在**出口
+// IP** 上——同一秒里 9 个不同账号一起拿到 429「user concurrency limit exceeded」，
+// 而单独一条永远是 200。所以真正的并发闸门是整个进程的（global_inflight，默认 1），
+// 账号再多也只是分摊额度，不是分摊并发。这条 429 不能当「这个账号忙」处理：那样 5 次
+// 之后所有账号一起休 180 秒，并行两个任务就整机 503 三分钟。
+//
+// 第三件事：选号按「最久没用的先用」轮转。老代码取最近用过的优先（MRU），静默的串行
+// 流量会一直黏在同一个账号上，10 个账号只有 1~2 个真的在耗额度。
+//
 // 另外三件事也在这里，因为它们的粒度只能是账号或整个进程：
 // - 起跑间隔：同一账号两次起步至少隔 800ms。实测 1.2 秒交错时正好一个进一个退，
 //   挨得太近就是 3008。
@@ -14,7 +23,8 @@
 // 队列是有时间的：排队超过 queue_ms（默认 120 秒）就答 429，而不是一直挂着。
 //
 // 预算分两本账，因为「被拒」和「跑过模型」在厂商那边不是一回事：
-// - 工作预算 rpm：一分钟里真正被收下的请求。被 3008 拒掉的尝试从这里退回去——
+// - 工作预算 rpm：**每个账号**一分钟里真正被收下的请求（整机的账按可用账号数放大）。
+//   被 3008 拒掉的尝试从这里退回去——
 //   它没有跑模型，占着预算只会让后面排队的请求空等到超时（实测 6 并发时 21 次
 //   拒绝把一整分钟的预算烧光，三个请求全在 120 秒上超时）。
 // - 到达上限 arrival_rpm：每一次发出去的请求都算，包括被拒的。它防的是 edge 按
@@ -49,6 +59,14 @@ pub struct Opts {
     /// 这是「软休息」：所有人都这样时 acquire 会等它，而不是报「都在休息」。
     pub broken_ms: u64,
     pub busy_waits: Vec<u64>,
+    /// 整个进程同时在飞的请求数。厂商对「同一个用户」限并发——实测压测时几个不同账号
+    /// 同时发也会一起拿到 429 `user concurrency limit exceeded`，说明这个「用户」是按出口
+    /// IP 算的，不是按账号。所以这里默认 1：真正的串行，排队发生在本地，而不是撞到
+    /// 厂商的 429 上（撞一次的代价是接下来几十秒全是 429）。
+    pub global_inflight: usize,
+    /// 撞到上面的并发限制之后，整个进程停多久再发。厂商那边是滑动窗口，短促重试只会
+    /// 让窗口一直不滑过去。
+    pub congest_ms: u64,
 }
 
 impl Default for Opts {
@@ -68,6 +86,8 @@ impl Default for Opts {
             auth_ms: 600_000,
             broken_ms: 1_500,
             busy_waits: vec![1_000, 2_000],
+            global_inflight: 1,
+            congest_ms: 800,
         }
     }
 }
@@ -93,6 +113,10 @@ struct Slot {
 
 struct Inner {
     slots: HashMap<String, Slot>,
+    /// 整个进程现在有几个请求在飞。见 Opts::global_inflight。
+    flying: usize,
+    /// 撞到厂商的按 IP 并发限制之后，整个进程停到什么时候。
+    congest_until: Option<Instant>,
     /// 进程级封路：405 或 3012 之后所有账号都不发。
     edge_until: Option<Instant>,
     edge_why: String,
@@ -180,12 +204,21 @@ fn window_gate(ledger: &[Instant], cap: usize, now: Instant, window: Duration) -
 
 impl Pool {
     pub fn new(opts: Opts) -> Arc<Self> {
+        let mut opts = opts;
+        // 压测用：整机并发上限可以直接用环境变量改，不用重新编译。
+        if let Ok(v) = std::env::var("ZCODE_SWITCH_GW_CONCURRENCY") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                opts.global_inflight = n.max(1);
+            }
+        }
         let live = Live::from(&opts);
         Arc::new(Self {
             opts,
             live: RwLock::new(live),
             inner: Mutex::new(Inner {
                 slots: HashMap::new(),
+                flying: 0,
+                congest_until: None,
                 edge_until: None,
                 edge_why: String::new(),
                 starts: Vec::new(),
@@ -196,6 +229,11 @@ impl Pool {
             }),
             ready: Notify::new(),
         })
+    }
+
+    /// global 是整机同时在飞的请求上限。
+    fn global(&self) -> usize {
+        self.opts.global_inflight.max(1)
     }
 
     /// touch 给每个目标建座位表，让 /healthz 一上来就能报全量。
@@ -221,20 +259,41 @@ impl Pool {
             inner.edge_until = None;
             inner.edge_why.clear();
         }
+        // 刚被厂商按出口 IP 的并发限制拒过：整机停一小会儿。这时候给某个账号记过是
+        // 没意义的——问题不在账号上。
+        if let Some(until) = inner.congest_until {
+            if until > now {
+                return Ready::Wait(until.duration_since(now));
+            }
+            inner.congest_until = None;
+        }
+        // 整个进程同时在飞的请求数。厂商的「user concurrency limit」是按出口 IP 算的，
+        // 不是按账号：多开账号不会让并发变大，只会撞 429。所以真正的并发闸门在这里，
+        // 超出的请求在本地排队。ZCODE_SWITCH_GW_CONCURRENCY 可以改这个数。
+        if inner.flying >= self.global() {
+            return Ready::Wait(Duration::from_millis(50));
+        }
         // 每分钟的总量：超了就让等，而不是硬发。工作账和到达账各一道闸。
+        // rpm 是「每个账号」的预算，整机的预算按能用的账号数放大——否则 10 个账号也
+        // 只有 12 次/分钟，等于只养活了半个账号。
         let live = *self.live.read().unwrap_or_else(|e| e.into_inner());
+        let seats = targets.len().max(1);
         let window = Duration::from_secs(60);
         inner.starts.retain(|t| now.duration_since(*t) < window);
         inner.arrivals.retain(|t| now.duration_since(*t) < window);
-        let gate = window_gate(&inner.starts, live.rpm, now, window)
-            .max(window_gate(&inner.arrivals, live.arrival_rpm(), now, window));
+        let gate = window_gate(&inner.starts, live.rpm.saturating_mul(seats), now, window)
+            .max(window_gate(&inner.arrivals, live.arrival_rpm().saturating_mul(seats), now, window));
 
         let limit = live.inflight;
         let mut wake = Duration::from_secs(3600);
         let mut rested = 0usize;
         let mut reason = String::new();
         let mut best: Option<String> = None;
-        let mut best_score: (u8, usize, Duration) = (u8::MAX, usize::MAX, Duration::MAX);
+        // 第三位是「距上次起步多久」，包成 Reverse 让最久没用的排最前：轮着用，
+        // 而不是一直喂同一个账号。老代码取最小，等于最近用过的优先（MRU），所以
+        // 10 个账号只有 1-2 个真的在耗额度。
+        let mut best_score: (u8, usize, std::cmp::Reverse<Duration>) =
+            (u8::MAX, usize::MAX, std::cmp::Reverse(Duration::MAX));
         for t in targets {
             if exclude.contains(&t.key) {
                 continue;
@@ -293,7 +352,8 @@ impl Pool {
                 wake = wake.min(Duration::from_millis(120));
                 continue;
             }
-            let score = (t.rank, slot.inflight, slot.last_start.map(|l| now.duration_since(l)).unwrap_or(Duration::MAX));
+            let age = slot.last_start.map(|l| now.duration_since(l)).unwrap_or(Duration::MAX);
+            let score = (t.rank, slot.inflight, std::cmp::Reverse(age));
             if score < best_score {
                 best_score = score;
                 best = Some(t.key.clone());
@@ -306,6 +366,7 @@ impl Pool {
                 slot.sent += 1;
                 slot.pending.push(now);
             }
+            inner.flying += 1;
             inner.starts.push(now);
             inner.arrivals.push(now);
             return Ready::Lease(Lease {
@@ -342,6 +403,7 @@ impl Pool {
             if let Some(slot) = inner.slots.get_mut(key) {
                 slot.inflight = slot.inflight.saturating_sub(1);
             }
+            inner.flying = inner.flying.saturating_sub(1);
         }
         self.ready.notify_waiters();
     }
@@ -407,6 +469,12 @@ impl Pool {
                 slot.rest_until = Some(now + Duration::from_millis(o.auth_ms));
                 slot.rest_kind = "auth";
             }
+            "congested" => {
+                // 厂商按出口 IP 限并发。这不是这个账号的问题：给账号记过会让全部账号
+                // 在几秒内一起进休息，然后整台机器三分钟发不出任何东西——这正是
+                // 「两个任务并行就全断」的现场。停整机一小会儿，让窗口滑过去。
+                inner.congest_until = Some(now + Duration::from_millis(o.congest_ms));
+            }
             "broken" => {
                 slot.rest_until = Some(now + Duration::from_millis(o.broken_ms));
                 slot.rest_kind = "broken";
@@ -419,7 +487,7 @@ impl Pool {
         }
         // 被拒的尝试没有跑模型：把它的起步时间从工作预算里退回去，后面的请求才排得动。
         // 到达账不退——edge 看到的是「到达了几次」，不是「收下了几个」。
-        if kind == "busy" {
+        if kind == "busy" || kind == "congested" {
             if let Some(t) = stamp {
                 inner.starts.retain(|s| *s != t);
             }
@@ -491,3 +559,100 @@ impl Pool {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(name: &str) -> Target {
+        Target {
+            account_id: name.to_string(),
+            account_name: name.to_string(),
+            provider: "builtin:zai-start-plan".into(),
+            plan: "start",
+            site: "zai",
+            dress: false,
+            rank: 0,
+            enabled: true,
+            key: format!("key-{name}"),
+            base: String::new(),
+            models: Vec::new(),
+            subject: name.to_string(),
+            device: String::new(),
+            label: name.to_string(),
+            aliases: Vec::new(),
+        }
+    }
+
+    fn pool(targets: &[Target]) -> Arc<Pool> {
+        // 起跑间隔是实测出来的节流，测轮转时把它去掉，否则每个账号都得等 800ms。
+        let opts = Opts {
+            start_gap_ms: 0,
+            ..Opts::default()
+        };
+        let pool = Pool::new(opts);
+        pool.touch(targets);
+        pool
+    }
+
+    fn pick(pool: &Arc<Pool>, targets: &[Target]) -> String {
+        match pool.acquire(targets, &HashSet::new()) {
+            Ready::Lease(l) => l.key().to_string(),
+            Ready::Wait(d) => panic!("expected a seat, waited {d:?}"),
+            Ready::Rest(why) => panic!("expected a seat, resting: {why}"),
+        }
+    }
+
+    /// 一轮请求应该把账号挨个用一遍，而不是黏在最近用过的那个上（老实现是 MRU，
+    /// 10 个账号只有 1~2 个真的在耗额度）。
+    #[test]
+    fn rotation_prefers_the_least_recently_used() {
+        let targets: Vec<Target> = ["a", "b", "c"].iter().map(|n| target(n)).collect();
+        let pool = pool(&targets);
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            let key = pick(&pool, &targets);
+            order.push(key.clone());
+            // 放座：Lease 掉 Drop 就放，这里手动来一次更直观
+            pool.release(&key);
+        }
+        assert_eq!(order, ["key-a", "key-b", "key-c", "key-a", "key-b", "key-c"]);
+    }
+
+    /// 整机同时只发一条：厂商按出口 IP 限并发，第二条必须排队，而不是再开一个账号。
+    #[test]
+    fn only_one_request_flies_at_a_time() {
+        let targets: Vec<Target> = ["a", "b"].iter().map(|n| target(n)).collect();
+        let pool = pool(&targets);
+        let lease = match pool.acquire(&targets, &HashSet::new()) {
+            Ready::Lease(l) => l,
+            _ => panic!("first acquire should get a seat"),
+        };
+        match pool.acquire(&targets, &HashSet::new()) {
+            Ready::Wait(_) => {}
+            Ready::Lease(_) => panic!("a second request must not fly while the first is out"),
+            Ready::Rest(why) => panic!("it should queue, not answer: {why}"),
+        }
+        drop(lease);
+        let _second = match pool.acquire(&targets, &HashSet::new()) {
+            Ready::Lease(l) => l,
+            _ => panic!("the seat is free again after release"),
+        };
+    }
+
+    /// 出口 IP 的并发拒绝不是账号的问题：不许给账号记过，只停整机一小会儿。
+    #[test]
+    fn concurrency_refusal_does_not_punish_the_account() {
+        let targets: Vec<Target> = ["a", "b"].iter().map(|n| target(n)).collect();
+        let pool = pool(&targets);
+        let key = pick(&pool, &targets);
+        pool.release(&key);
+        pool.note(&key, "congested");
+        let snapshot = pool.snapshot();
+        for (_, inflight, _sent, rest) in snapshot.iter() {
+            assert_eq!(*inflight, 0);
+            assert!(rest.is_none(), "no account may go to rest because of an IP-wide refusal");
+        }
+    }
+}
+

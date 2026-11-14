@@ -124,6 +124,11 @@ fn classify(status: u16, text: &str) -> &'static str {
     if status == 405 || low.contains("aliyun") || low.contains("has been blocked") {
         return "edge";
     }
+    // 厂商的「user concurrency limit exceeded」是按出口 IP 算的，跟是哪个账号无关：
+    // 它必须先于下面的码表判断，否则会被当成普通的 3008 busy，从而去罚账号。
+    if low.contains("concurrency") {
+        return "congested";
+    }
     match upstream::code_of(text) {
         Some(3008) | Some(3009) | Some(3010) => return "busy",
         Some(1113) | Some(1005) => return "spent",
@@ -147,7 +152,7 @@ fn classify(status: u16, text: &str) -> &'static str {
 fn status_for(kind: &str) -> StatusCode {
     match kind {
         "spent" => StatusCode::PAYMENT_REQUIRED,
-        "busy" | "rate" => StatusCode::TOO_MANY_REQUESTS,
+        "busy" | "rate" | "congested" => StatusCode::TOO_MANY_REQUESTS,
         "risk" => StatusCode::FORBIDDEN,
         "edge" => StatusCode::SERVICE_UNAVAILABLE,
         "auth" => StatusCode::UNAUTHORIZED,
@@ -332,6 +337,7 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
         let pick = match ctx.pool.acquire(&serving, &exclude) {
             Ready::Lease(l) => l,
             Ready::Wait(d) => {
+                crate::flowlog::log("gateway", "wait", &format!("{}ms attempt={attempt}", d.as_millis()));
                 ctx.pool.wait(d).await;
                 continue;
             }
@@ -348,10 +354,13 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
             }
         };
         attempt += 1;
+        let t0 = Instant::now();
+        let who = target.label.clone();
         let (resp, spelling) = match open_once(&req, &want, &target, &ctx.app_version).await {
             Ok(v) => v,
             Err((kind, message)) => {
                 ctx.pool.note(&target.key, kind);
+                crate::flowlog::log("gateway", "send-fail", &format!("{who} {kind} {}ms {message}", t0.elapsed().as_millis()));
                 last = (kind, message);
                 if kind == "timeout" || kind == "net" {
                     dead.insert(target.key.clone());
@@ -388,6 +397,7 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
                 Err(why) => {
                     // 一个字节都还没交给客户端：换账号重来，它那边什么都看不见。
                     ctx.pool.note(&target.key, "broken");
+                    crate::flowlog::log("gateway", "broken", &format!("{who} {why} {}ms", t0.elapsed().as_millis()));
                     last = ("broken", why);
                     broken.insert(target.key.clone());
                     drop(pick);
@@ -425,6 +435,7 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
         };
         let kind = classify(status, &reply.text);
         ctx.pool.note(&target.key, kind);
+        crate::flowlog::log("gateway", "try", &format!("{who} http{status} {kind} {}ms {}", t0.elapsed().as_millis(), upstream::message_of(&reply.text)));
         drop(pick);
 
         if kind == "ok" {
@@ -475,6 +486,10 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
                     break;
                 }
                 ctx.pool.wait(Duration::from_millis(wait)).await;
+            }
+            "congested" => {
+                // 出口 IP 上的并发闸门：pool 已经把整机停了一小会儿，换账号也没用，
+                // 所以不把它算进 busy_round，也不把这个账号关进 dead。
             }
             "spent" => {
                 saw_spent = true;
