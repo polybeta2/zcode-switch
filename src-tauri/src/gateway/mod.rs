@@ -149,7 +149,7 @@ pub fn status_of(paths: &Paths) -> Value {
         "token": token_for(paths),
         "uptime_s": guard.as_ref().map(|r| r.started.elapsed().as_secs()).unwrap_or(0),
         "targets": targets.len(),
-        "models": accounts::served_models(paths, &targets),
+        "models": accounts::served_models(&targets),
     })
 }
 

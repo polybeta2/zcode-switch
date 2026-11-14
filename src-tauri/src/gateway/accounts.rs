@@ -250,44 +250,24 @@ pub fn models_of(targets: &[Target]) -> Vec<String> {
     seen
 }
 
+/// PLAN_MODELS 是 start plan 真能跑的模型名，只在「没有一个套餐声明模型」时用来填
+/// /v1/models 和设置页那行提示。
+///
+/// 为什么只有 Flash：同样的请求发 GLM-5.3 回来是 402「exceed quota limit」——start plan
+/// 只带 Flash 的额度，写上去等于保证用户会撞一次 402（2026-11-14 实测）。
+///
+/// 也故意不读 ZCode 客户端自己的 provider_config.json 当兜底：那里面的 modelId 是用户
+/// 另外加的第三方中转供应商（胖猫 / 111111 / 4Router …）自报的型号，跟 z.ai 的 Coding
+/// Plan 一点关系都没有，列出来只会让人以为这些模型来自账号额度。
+const PLAN_MODELS: &[&str] = &["GLM-5.3-Flash"];
+
 /// served_models 是网关对外报的模型名：套餐声明过的优先；一个都没声明时（比如只剩
-/// start-plan，它的 models 是空的、任何名字都接）退到 ZCode 认识的那些，免得空着。
-pub fn served_models(paths: &Paths, targets: &[Target]) -> Vec<String> {
+/// start-plan，它的 models 是空的、任何名字都接）报 PLAN_MODELS。
+pub fn served_models(targets: &[Target]) -> Vec<String> {
     let declared = models_of(targets);
     if declared.is_empty() {
-        read_models(paths)
+        PLAN_MODELS.iter().map(|s| s.to_string()).collect()
     } else {
         declared
     }
-}
-
-const FALLBACK_MODELS: &[&str] = &["glm-4.6", "glm-4.5", "glm-4.5-air"];
-
-/// read_models 是 ZCode 自己的 provider_config.json 知道的模型，作为没有套餐时的兜底。
-pub fn read_models(paths: &Paths) -> Vec<String> {
-    let cfg: Option<Value> = std::fs::read_to_string(paths.zcode_dir().join("v2").join("provider_config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
-    let mut ids: Vec<String> = Vec::new();
-    let mut add = |v: Option<&Value>| {
-        if let Some(s) = v.and_then(|x| x.as_str()) {
-            let s = s.trim();
-            if !s.is_empty() && !ids.contains(&s.to_string()) {
-                ids.push(s.to_string());
-            }
-        }
-    };
-    if let Some(rules) = cfg.as_ref().and_then(|c| c.get("config")).and_then(|c| c.get("modelConfigRules")) {
-        for key in ["providerModelRules", "manualProviderModelRules"] {
-            if let Some(arr) = rules.get(key).and_then(|a| a.as_array()) {
-                for r in arr {
-                    add(r.get("modelId"));
-                }
-            }
-        }
-    }
-    if ids.is_empty() {
-        ids = FALLBACK_MODELS.iter().map(|s| s.to_string()).collect();
-    }
-    ids
 }

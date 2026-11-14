@@ -67,10 +67,9 @@ impl Ctx {
     }
 
     /// models 是这个网关对外报的模型名。套餐自己声明过的优先；套餐都没声明时
-    /// （比如只剩 start-plan，它的 models 是空的、任何名字都接）退到 ZCode 配置里
-    /// 认识的那些，免得 /v1/models 空着。
+    /// （比如只剩 start-plan，它的 models 是空的、任何名字都接）报计划里的那一组。
     pub fn models(&self) -> Vec<String> {
-        accounts::served_models(&self.paths, &self.targets())
+        accounts::served_models(&self.targets())
     }
 }
 

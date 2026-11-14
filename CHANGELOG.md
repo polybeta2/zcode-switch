@@ -10,7 +10,7 @@
 ### 修复：停用的套餐不再被派发
 
 - 配置里 `enabled: false` 的套餐以前只影响排序，被停掉的 coding plan 照样吃到真请求并回 `1113`。现在它们在建账号池时就被剔除，`/healthz` 报的可发账号数随之变少——这个数是真能发的数。
-- 连着的一个副作用也补上了：剔掉之后如果没有任何套餐声明模型（start-plan 的 `models` 是空的、什么名字都接），`/v1/models` 和 `/healthz` 的模型列表会退回 ZCode 自己 provider 配置里的名字，不再空着。
+- 连着的一个副作用也补上了：剔掉之后如果没有任何套餐声明模型（start-plan 的 `models` 是空的、什么名字都接），`/v1/models` 和 `/healthz` 的模型列表会报 `GLM-5.3-Flash`，不再空着。**不**拿 ZCode 客户端 `provider_config.json` 里的 modelId 兜底——那是你自己另加的第三方中转供应商（胖猫 / 111111 / 4Router …）自报的型号，跟账号额度无关；`GLM-5.3`（不带 Flash）也不列，start plan 打过去是 402 `exceed quota limit`。
 
 ### 新增：并发与节流可调
 
