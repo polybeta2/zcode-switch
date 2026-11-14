@@ -173,6 +173,24 @@ const actions = {
     }
   },
 
+  // 两个节流旋钮：并发和每分钟预算。后端写进 gateway.json 并立刻作用到正在跑的网关上。
+  async saveGatewayLimits() {
+    const read = (sel, lo, hi) => {
+      const el = document.querySelector(sel);
+      const n = el ? Math.round(Number(el.value)) : NaN;
+      return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : null;
+    };
+    const inflight = read(".gw-inflight", 1, 8);
+    const rpm = read(".gw-rpm", 1, 120);
+    if (inflight === null && rpm === null) return;
+    await guard(async () => {
+      gateway = await invoke("gateway_set_limits", { inflight, rpm });
+      render();
+      const lim = (gateway && gateway.limits) || {};
+      toast(t("s.gatewayLimitsSaved"), "ok", `${lim.inflight || "-"} / ${lim.rpm || "-"}`);
+    });
+  },
+
   async copyGateway() {
     const text = (gateway && gateway.base) || "";
     if (!text) return;
@@ -219,6 +237,8 @@ function render() {
     return;
   }
   const s = state;
+  // 节流那一对：跑着的是正在用的，没跑的是下次会用的
+  const lim = (gateway && gateway.limits) || { inflight: 1, rpm: 12 };
   document.title = `Z·SWITCH ${t("s.title")}`;
   if (IS_MAC) {
     renderMac(s);
@@ -252,6 +272,14 @@ function render() {
         <button class="btn-ghost" click="actions.copyGatewayToken()">${t("s.gatewayCopyToken")}</button>
       </div>
       <div class="hint">${t("s.gatewayHint", { n: (gateway && gateway.targets) || 0, m: ((gateway && gateway.models) || []).join(", ") || "—" })}</div>
+      <div class="path-line gw-limits" style="margin-top:6px">
+        <span class="gw-limit">${t("s.gatewayInflight")}</span>
+        <input class="zcode-path gw-inflight" type="number" min="1" max="8" value="${lim.inflight}" />
+        <span class="gw-limit">${t("s.gatewayRpm")}</span>
+        <input class="zcode-path gw-rpm" type="number" min="1" max="120" value="${lim.rpm}" />
+        <button class="btn-ghost" click="actions.saveGatewayLimits()">${t("common.save")}</button>
+      </div>
+      <div class="hint">${t("s.gatewayLimitsHint")}</div>
       <label style="margin-top:14px">${t("s.libLabel")}</label>
       <div class="lib-row">
         <button class="btn-ghost has-ic" click="actions.importFiles()">${ic("import", 14)} ${t("s.importBtn")}</button>
@@ -309,6 +337,14 @@ function renderMac(s) {
           <button class="btn-ghost" click="actions.copyGatewayToken()">${t("s.gatewayCopyToken")}</button>
         </div>
         <div class="hint">${t("s.gatewayHint", { n: (gateway && gateway.targets) || 0, m: ((gateway && gateway.models) || []).join(", ") || "—" })}</div>
+        <div class="path-line gw-limits" style="margin-top:6px">
+          <span class="gw-limit">${t("s.gatewayInflight")}</span>
+          <input class="zcode-path gw-inflight" type="number" min="1" max="8" value="${lim.inflight}" />
+          <span class="gw-limit">${t("s.gatewayRpm")}</span>
+          <input class="zcode-path gw-rpm" type="number" min="1" max="120" value="${lim.rpm}" />
+          <button class="btn-ghost" click="actions.saveGatewayLimits()">${t("common.save")}</button>
+        </div>
+        <div class="hint">${t("s.gatewayLimitsHint")}</div>
       </div>
 
       <div class="s-group-label">${t("mac.accounts")}</div>

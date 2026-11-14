@@ -16,7 +16,7 @@ pub mod upstream;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -31,6 +31,8 @@ struct Running {
     port: u16,
     stop: Option<oneshot::Sender<()>>,
     started: Instant,
+    /// 留着它，是为了能热改并发与每分钟预算：改了立刻生效，不用停一次网关。
+    pool: Arc<Pool>,
 }
 
 fn slot() -> &'static Mutex<Option<Running>> {
@@ -87,6 +89,21 @@ pub fn token_for(paths: &Paths) -> String {
     }
 }
 
+/// opts_from 读 gateway.json 里那两个能调的旋钮。其余节流参数是实测出来的常数：
+/// 起跑间隔 800ms、繁忙冷却 1.2s、风控/edge 休息 3 分钟——这些改了就得重新测，
+/// 所以不开放。能被调的只有「一个账号同时几个」和「一分钟起几个」。
+fn opts_from(paths: &Paths) -> Opts {
+    let cfg = read_config(paths);
+    let mut opts = Opts::default();
+    if let Some(n) = cfg.get("inflight").and_then(|v| v.as_u64()) {
+        opts.inflight = (n as usize).clamp(1, 8);
+    }
+    if let Some(n) = cfg.get("rpm").and_then(|v| v.as_u64()) {
+        opts.rpm = (n as usize).clamp(1, 120);
+    }
+    opts
+}
+
 /// 固定端口：客户端配置里写的是这个地址，所以它不能跟着「上回用了哪个」变。
 /// 旧版本会把实际端口写进 gateway.json，端口一漂就把客户端甩在原地 —— 这里不再读它。
 fn fixed_port() -> u16 {
@@ -116,14 +133,23 @@ pub fn status_of(paths: &Paths) -> Value {
         None => format!("http://127.0.0.1:{}/v1", fixed_port()),
     };
     let targets = accounts::load_targets(paths, true, None, None);
+    // 跑着的时候报告的是真的在用的那一对；没跑的时候报告下一次会用的那一对
+    let (inflight, rpm) = match guard.as_ref() {
+        Some(r) => r.pool.limits(),
+        None => {
+            let o = opts_from(paths);
+            (o.inflight, o.rpm)
+        }
+    };
     json!({
         "running": guard.is_some(),
+        "limits": { "inflight": inflight, "rpm": rpm },
         "port": guard.as_ref().map(|r| r.port).unwrap_or_else(fixed_port),
         "base": base,
         "token": token_for(paths),
         "uptime_s": guard.as_ref().map(|r| r.started.elapsed().as_secs()).unwrap_or(0),
         "targets": targets.len(),
-        "models": accounts::models_of(&targets),
+        "models": accounts::served_models(paths, &targets),
     })
 }
 
@@ -142,8 +168,8 @@ pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
 
-    let pool = Pool::new(Opts::default());
-    let ctx = server::Ctx::new(paths.clone(), pool, token.clone(), true);
+    let pool = Pool::new(opts_from(&paths));
+    let ctx = server::Ctx::new(paths.clone(), Arc::clone(&pool), token.clone(), true);
     ctx.targets();
     let app = server::router(ctx);
     let (tx, rx) = oneshot::channel::<()>();
@@ -161,7 +187,12 @@ pub async fn start(paths: Paths, port: Option<u16>) -> Result<Value, String> {
 
     {
         let mut guard = slot().lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(Running { port: actual, stop: Some(tx), started: Instant::now() });
+        *guard = Some(Running {
+            port: actual,
+            stop: Some(tx),
+            started: Instant::now(),
+            pool: Arc::clone(&pool),
+        });
     }
     let mut cfg = read_config(&paths);
     if let Some(o) = cfg.as_object_mut() {
@@ -192,6 +223,48 @@ pub fn stop(paths: &Paths) -> Value {
 #[tauri::command]
 pub fn gateway_status() -> Value {
     status_of(&Paths::detect())
+}
+
+/// set_limits 把两个旋钮写进 gateway.json，并且立刻作用到正在跑的那个网关上：
+/// 改并发不该要求先停一次（停一次就断掉正在答的请求）。
+pub fn set_limits(paths: &Paths, inflight: Option<u32>, rpm: Option<u32>) -> Value {
+    let want_inflight = inflight.map(|n| n.clamp(1, 8));
+    let want_rpm = rpm.map(|n| n.clamp(1, 120));
+    let mut cfg = read_config(paths);
+    if let Some(o) = cfg.as_object_mut() {
+        if let Some(n) = want_inflight {
+            o.insert("inflight".into(), json!(n));
+        }
+        if let Some(n) = want_rpm {
+            o.insert("rpm".into(), json!(n));
+        }
+    }
+    write_config(paths, &cfg);
+    // applied_live 说的是「正在跑的那个网关是不是本进程」：设置页改的永远是本进程，
+    // 所以立刻生效；CLI 改的是别的进程起的网关，只能写进配置等它下次启动。
+    let applied_live = {
+        let guard = slot().lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(r) => {
+                r.pool.retune(
+                    want_inflight.map(|n| n as usize),
+                    want_rpm.map(|n| n as usize),
+                );
+                true
+            }
+            None => false,
+        }
+    };
+    let mut out = status_of(paths);
+    if let Some(o) = out.as_object_mut() {
+        o.insert("applied_live".into(), json!(applied_live));
+    }
+    out
+}
+
+#[tauri::command]
+pub fn gateway_set_limits(inflight: Option<u32>, rpm: Option<u32>) -> Value {
+    set_limits(&Paths::detect(), inflight, rpm)
 }
 
 #[tauri::command]

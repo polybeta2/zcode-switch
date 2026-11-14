@@ -1858,6 +1858,7 @@ pub fn run() {
             reveal_main,
             glass::glass_sync,
             gateway::gateway_status,
+            gateway::gateway_set_limits,
             gateway::gateway_start,
             gateway::gateway_stop,
         ])

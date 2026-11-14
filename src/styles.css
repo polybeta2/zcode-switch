@@ -444,6 +444,10 @@ input:focus-visible,
 }
 .settings .path-line { display: flex; gap: 8px; }
 .settings .path-line .btn-ghost { flex: none; }
+/* 网关的两个节流旋钮：数字框不该像路径框那样撑满一行 */
+.settings .gw-limits { align-items: center; }
+.settings .gw-limit { flex: none; font-family: var(--mono); font-size: 12px; letter-spacing: .06em; color: var(--ink-mute); }
+.settings .gw-limits input.zcode-path { flex: none; width: 76px; text-align: center; }
 .settings input {
   flex: 1;
   min-width: 0;

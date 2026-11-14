@@ -221,6 +221,88 @@ fn an_edge_refusal_rests_the_whole_address() {
 }
 
 #[test]
+fn a_refusal_gives_the_minute_budget_back() {
+    use gateway::pool::{Opts, Pool, Ready};
+    let pool = Pool::new(Opts {
+        inflight: 1,
+        start_gap_ms: 0,
+        busy_cooldown_ms: 0,
+        rpm: 1,
+        ..Default::default()
+    });
+    let targets = vec![target("a", "k1")];
+    let none: HashSet<String> = HashSet::new();
+    {
+        let seat = match pool.acquire(&targets, &none) {
+            Ready::Lease(l) => l,
+            _ => panic!("expected a seat"),
+        };
+        drop(seat);
+    }
+    // 一分钟只准起一次。被 3008 拒掉的那次没有跑模型，预算要退回来，
+    // 否则后面的请求只能空等到 120 秒超时。
+    pool.note("k1", "busy");
+    match pool.acquire(&targets, &none) {
+        Ready::Lease(_) => {}
+        _ => panic!("a refused attempt kept the whole minute's budget"),
+    }
+}
+
+#[test]
+fn refused_attempts_still_count_as_arrivals() {
+    use gateway::pool::{Opts, Pool, Ready};
+    let pool = Pool::new(Opts {
+        inflight: 1,
+        start_gap_ms: 0,
+        busy_cooldown_ms: 0,
+        rpm: 1,
+        ..Default::default()
+    });
+    let targets = vec![target("a", "k1")];
+    let none: HashSet<String> = HashSet::new();
+    // rpm=1 时到达上限是 3：连拒三次之后到达账满了，第四次不能再发。
+    // 被拒的请求不跑模型，但仍然到达厂商的 edge——405 是按到达速率封的。
+    for _ in 0..3 {
+        {
+            let seat = match pool.acquire(&targets, &none) {
+                Ready::Lease(l) => l,
+                _ => panic!("expected a seat"),
+            };
+            drop(seat);
+        }
+        pool.note("k1", "busy");
+    }
+    match pool.acquire(&targets, &none) {
+        Ready::Wait(_) => {}
+        _ => panic!("refused attempts were treated as free arrivals"),
+    }
+}
+
+#[test]
+fn the_pacing_knobs_can_be_changed_while_it_runs() {
+    use gateway::pool::{Opts, Pool, Ready};
+    let pool = Pool::new(Opts { inflight: 1, start_gap_ms: 0, rpm: 1, ..Default::default() });
+    let targets = vec![target("a", "k1")];
+    let none: HashSet<String> = HashSet::new();
+    {
+        let seat = match pool.acquire(&targets, &none) {
+            Ready::Lease(l) => l,
+            _ => panic!("expected a seat"),
+        };
+        drop(seat);
+    }
+    pool.note("k1", "ok");
+    match pool.acquire(&targets, &none) {
+        Ready::Wait(_) => {}
+        _ => panic!("the minute's budget was not enforced"),
+    }
+    // 不用重启网关：调大预算之后下一问就该有座
+    pool.retune(None, Some(2));
+    assert!(matches!(pool.acquire(&targets, &none), Ready::Lease(_)));
+    assert_eq!(pool.limits(), (1, 2));
+}
+
+#[test]
 fn a_plan_is_addressed_by_its_own_spelling() {
     let t = target("a", "k1");
     assert_eq!(gateway::accounts::models_of(&[t.clone()]), vec!["GLM-5.3-Flash".to_string()]);

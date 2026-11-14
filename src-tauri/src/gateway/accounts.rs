@@ -207,6 +207,9 @@ pub fn load_targets(
             }
         }
     }
+    // 停用的套餐不发：配置里写着 enabled: false 的条目，网关就不该再拿它去花额度。
+    // 以前这个字段只用来排序，于是被停掉的 coding plan 照样吃到真请求，回 1113。
+    all.retain(|t| t.enabled);
     if let Some(want) = plans {
         let set: HashSet<&str> = want.iter().map(|s| s.as_str()).collect();
         all.retain(|t| set.contains(t.plan));
@@ -245,6 +248,17 @@ pub fn models_of(targets: &[Target]) -> Vec<String> {
         }
     }
     seen
+}
+
+/// served_models 是网关对外报的模型名：套餐声明过的优先；一个都没声明时（比如只剩
+/// start-plan，它的 models 是空的、任何名字都接）退到 ZCode 认识的那些，免得空着。
+pub fn served_models(paths: &Paths, targets: &[Target]) -> Vec<String> {
+    let declared = models_of(targets);
+    if declared.is_empty() {
+        read_models(paths)
+    } else {
+        declared
+    }
 }
 
 const FALLBACK_MODELS: &[&str] = &["glm-4.6", "glm-4.5", "glm-4.5-air"];

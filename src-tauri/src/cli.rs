@@ -464,6 +464,12 @@ pub fn run(args: &[String]) -> (String, i32) {
                 }
                 "start" => {
                     let port = flag(rest, "--port").and_then(|p| p.parse::<u16>().ok());
+                    // 并发和每分钟预算：给了就写进 gateway.json，以后每次启动都照这个跑
+                    let inflight = flag(rest, "--inflight").and_then(|v| v.parse::<u32>().ok());
+                    let rpm = flag(rest, "--rpm").and_then(|v| v.parse::<u32>().ok());
+                    if inflight.is_some() || rpm.is_some() {
+                        let _ = crate::gateway::set_limits(&paths, inflight, rpm);
+                    }
                     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                         Ok(r) => r,
                         Err(e) => return (err(&e.to_string()), 1),
@@ -487,7 +493,24 @@ pub fn run(args: &[String]) -> (String, i32) {
                     let st = crate::gateway::stop(&paths);
                     ok(json!({ "stopped_here": true, "note": "if the app started it, stop it from the app", "status": st }))
                 }
-                other => return (err(&format!("gateway: unknown subcommand {other} (status|start|stop)")), 2),
+                "limits" => {
+                    // 只改这两个数：正在跑的网关立刻换挡，没跑的写进配置等下次
+                    let inflight = flag(rest, "--inflight").and_then(|v| v.parse::<u32>().ok());
+                    let rpm = flag(rest, "--rpm").and_then(|v| v.parse::<u32>().ok());
+                    if inflight.is_none() && rpm.is_none() {
+                        let st = crate::gateway::status_of(&paths);
+                        return (ok(st.get("limits").cloned().unwrap_or_else(|| json!({}))), 0);
+                    }
+                    ok(crate::gateway::set_limits(&paths, inflight, rpm))
+                }
+                other => {
+                    return (
+                        err(&format!(
+                            "gateway: unknown subcommand {other} (status|start|stop|limits)"
+                        )),
+                        2,
+                    )
+                }
             }
         }
         other => return (err(&crate::i18n::trf("cli.unknown_cmd", &[("cmd", other)])), 2),

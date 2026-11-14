@@ -12,9 +12,16 @@
 //   共享的，所以这两个是进程级的暂停，不是这个账号的。
 //
 // 队列是有时间的：排队超过 queue_ms（默认 120 秒）就答 429，而不是一直挂着。
+//
+// 预算分两本账，因为「被拒」和「跑过模型」在厂商那边不是一回事：
+// - 工作预算 rpm：一分钟里真正被收下的请求。被 3008 拒掉的尝试从这里退回去——
+//   它没有跑模型，占着预算只会让后面排队的请求空等到超时（实测 6 并发时 21 次
+//   拒绝把一整分钟的预算烧光，三个请求全在 120 秒上超时）。
+// - 到达上限 arrival_rpm：每一次发出去的请求都算，包括被拒的。它防的是 edge 按
+//   到达速率封 IP（405），所以只能调高不能取消；默认取工作预算的三倍。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -73,6 +80,8 @@ struct Slot {
     rest_kind: &'static str,
     sent: usize,
     refusals: usize,
+    /// 已经发出去、还没有结局的起步时间。被拒时要凭它把这一笔从工作预算里退掉。
+    pending: Vec<Instant>,
     /// 最近两次被 3008 拒的时间，用来判断「一直在被拒」而不是「偶尔被拒」。
     recent: Vec<Instant>,
 }
@@ -82,14 +91,37 @@ struct Inner {
     /// 进程级封路：405 或 3012 之后所有账号都不发。
     edge_until: Option<Instant>,
     edge_why: String,
+    /// 工作预算：被收下的请求（被拒的会被退掉）。
     starts: Vec<Instant>,
+    /// 到达预算：所有发出去的请求，只增不减。
+    arrivals: Vec<Instant>,
     served: usize,
     refused: usize,
     since: Instant,
 }
 
+/// Live 是两个可以热改的数：并发和每分钟预算。其余节流参数是实测出来的常数，
+/// 改了就要重新测，所以它们留在 Opts 里不动。
+#[derive(Clone, Copy, Debug)]
+struct Live {
+    inflight: usize,
+    rpm: usize,
+}
+
+impl Live {
+    fn from(opts: &Opts) -> Self {
+        Self { inflight: opts.inflight.max(1), rpm: opts.rpm.max(1) }
+    }
+
+    /// 到达上限：被拒的请求不跑模型，但仍然到达一次厂商的 edge。
+    fn arrival_rpm(&self) -> usize {
+        self.rpm.saturating_mul(3).max(self.rpm)
+    }
+}
+
 pub struct Pool {
     pub opts: Opts,
+    live: RwLock<Live>,
     inner: Mutex<Inner>,
     ready: Notify,
 }
@@ -130,15 +162,29 @@ impl Drop for Lease {
     }
 }
 
+/// window_gate 说「这本账满了没有，满了还要等多久」。两本账用同一套算法。
+fn window_gate(ledger: &[Instant], cap: usize, now: Instant, window: Duration) -> Duration {
+    if ledger.len() < cap.max(1) {
+        return Duration::ZERO;
+    }
+    ledger
+        .first()
+        .map(|t| window.saturating_sub(now.duration_since(*t)))
+        .unwrap_or(Duration::from_secs(1))
+}
+
 impl Pool {
     pub fn new(opts: Opts) -> Arc<Self> {
+        let live = Live::from(&opts);
         Arc::new(Self {
             opts,
+            live: RwLock::new(live),
             inner: Mutex::new(Inner {
                 slots: HashMap::new(),
                 edge_until: None,
                 edge_why: String::new(),
                 starts: Vec::new(),
+                arrivals: Vec::new(),
                 served: 0,
                 refused: 0,
                 since: Instant::now(),
@@ -150,7 +196,7 @@ impl Pool {
     /// touch 给每个目标建座位表，让 /healthz 一上来就能报全量。
     pub fn touch(&self, targets: &[Target]) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let limit = self.opts.inflight.max(1);
+        let limit = self.live.read().unwrap_or_else(|e| e.into_inner()).inflight;
         for t in targets {
             inner.slots.entry(t.key.clone()).or_insert_with(|| Slot {
                 limit,
@@ -170,20 +216,15 @@ impl Pool {
             inner.edge_until = None;
             inner.edge_why.clear();
         }
-        // 每分钟的总量：超了就让等，而不是硬发。
+        // 每分钟的总量：超了就让等，而不是硬发。工作账和到达账各一道闸。
+        let live = *self.live.read().unwrap_or_else(|e| e.into_inner());
         let window = Duration::from_secs(60);
         inner.starts.retain(|t| now.duration_since(*t) < window);
-        let gate = if inner.starts.len() >= self.opts.rpm.max(1) {
-            inner
-                .starts
-                .first()
-                .map(|t| window.saturating_sub(now.duration_since(*t)))
-                .unwrap_or(Duration::from_secs(1))
-        } else {
-            Duration::ZERO
-        };
+        inner.arrivals.retain(|t| now.duration_since(*t) < window);
+        let gate = window_gate(&inner.starts, live.rpm, now, window)
+            .max(window_gate(&inner.arrivals, live.arrival_rpm(), now, window));
 
-        let limit = self.opts.inflight.max(1);
+        let limit = live.inflight;
         let mut wake = Duration::from_secs(3600);
         let mut rested = 0usize;
         let mut reason = String::new();
@@ -197,6 +238,8 @@ impl Pool {
                 limit,
                 ..Default::default()
             });
+            // 没有结局的起步（客户端断了连接）不能一直挂在待定队列上
+            slot.pending.retain(|t| now.duration_since(*t) < window);
             // 一个被挤窄的座位到期恢复
             if let Some(until) = slot.narrow_until {
                 if until <= now {
@@ -250,8 +293,10 @@ impl Pool {
                 slot.inflight += 1;
                 slot.last_start = Some(now);
                 slot.sent += 1;
+                slot.pending.push(now);
             }
             inner.starts.push(now);
+            inner.arrivals.push(now);
             return Ready::Lease(Lease {
                 pool: Arc::clone(self),
                 key,
@@ -310,10 +355,17 @@ impl Pool {
                 "a risk code came back; the whole address is resting".to_string()
             };
         }
+        let live = *self.live.read().unwrap_or_else(|e| e.into_inner());
         let slot = inner.slots.entry(key.to_string()).or_insert_with(|| Slot {
-            limit: o.inflight.max(1),
+            limit: live.inflight,
             ..Default::default()
         });
+        // 这一笔的起步时间：结局回来了，就从待定队列里取最老的一条
+        let stamp = if slot.pending.is_empty() {
+            None
+        } else {
+            Some(slot.pending.remove(0))
+        };
         match kind {
             "busy" => {
                 slot.refusals += 1;
@@ -350,6 +402,45 @@ impl Pool {
             }
             _ => {}
         }
+        // 被拒的尝试没有跑模型：把它的起步时间从工作预算里退回去，后面的请求才排得动。
+        // 到达账不退——edge 看到的是「到达了几次」，不是「收下了几个」。
+        if kind == "busy" {
+            if let Some(t) = stamp {
+                inner.starts.retain(|s| *s != t);
+            }
+        }
+        drop(inner);
+        self.ready.notify_waiters();
+    }
+
+    /// retune 改两个能热改的数。已经在飞的请求不受影响；没被挤窄的座位立刻按新的
+    /// 并发上限放行。
+    pub fn retune(&self, inflight: Option<usize>, rpm: Option<usize>) {
+        {
+            let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = inflight {
+                live.inflight = n.clamp(1, 8);
+            }
+            if let Some(n) = rpm {
+                live.rpm = n.clamp(1, 120);
+            }
+        }
+        let now_limit = self.live.read().unwrap_or_else(|e| e.into_inner()).inflight;
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            for slot in inner.slots.values_mut() {
+                if slot.narrow_until.is_none() {
+                    slot.limit = now_limit;
+                }
+            }
+        }
+        self.ready.notify_waiters();
+    }
+
+    /// limits 是当前生效的那一对数：给 /healthz、设置页和 CLI 看。
+    pub fn limits(&self) -> (usize, usize) {
+        let live = *self.live.read().unwrap_or_else(|e| e.into_inner());
+        (live.inflight, live.rpm)
     }
 
     pub fn stats(&self) -> (usize, usize, Duration) {

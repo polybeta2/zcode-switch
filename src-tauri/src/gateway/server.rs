@@ -65,6 +65,13 @@ impl Ctx {
         *cache = Some((Instant::now(), list.clone()));
         list
     }
+
+    /// models 是这个网关对外报的模型名。套餐自己声明过的优先；套餐都没声明时
+    /// （比如只剩 start-plan，它的 models 是空的、任何名字都接）退到 ZCode 配置里
+    /// 认识的那些，免得 /v1/models 空着。
+    pub fn models(&self) -> Vec<String> {
+        accounts::served_models(&self.paths, &self.targets())
+    }
 }
 
 pub fn router(ctx: Arc<Ctx>) -> Router {
@@ -177,7 +184,7 @@ fn model_for(t: &Target, want: &str) -> Option<String> {
 // ---------------------------------------------------------------- 路由
 
 async fn root(State(ctx): State<Arc<Ctx>>) -> Response {
-    let models = accounts::models_of(&ctx.targets());
+    let models = ctx.models();
     axum::Json(json!({
         "gateway": "zcode-switch",
         "version": env!("CARGO_PKG_VERSION"),
@@ -219,7 +226,11 @@ async fn healthz(State(ctx): State<Arc<Ctx>>) -> Response {
         "uptime_s": uptime.as_secs(),
         "served": served,
         "refused": refused,
-        "models": accounts::models_of(&targets),
+        "models": ctx.models(),
+        "limits": {
+            "inflight": ctx.pool.limits().0,
+            "rpm": ctx.pool.limits().1,
+        },
         "targets": rows,
         "resting": ctx.pool.resting().map(|(d, why)| json!({ "for_s": d.as_secs(), "why": why })),
     }))
@@ -227,7 +238,7 @@ async fn healthz(State(ctx): State<Arc<Ctx>>) -> Response {
 }
 
 async fn models(State(ctx): State<Arc<Ctx>>) -> Response {
-    let list: Vec<Value> = accounts::models_of(&ctx.targets())
+    let list: Vec<Value> = ctx.models()
         .into_iter()
         .map(|id| {
             json!({
@@ -242,7 +253,7 @@ async fn models(State(ctx): State<Arc<Ctx>>) -> Response {
 }
 
 async fn model_one(State(ctx): State<Arc<Ctx>>, axum::extract::Path(id): axum::extract::Path<String>) -> Response {
-    match accounts::models_of(&ctx.targets())
+    match ctx.models()
         .into_iter()
         .find(|m| m.eq_ignore_ascii_case(&id))
     {
@@ -298,8 +309,7 @@ async fn turn(ctx: &Arc<Ctx>, req: Value, speak_openai: bool) -> Response {
     let stream = req.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
     let serving: Vec<Target> = targets.iter().filter(|t| model_for(t, &want).is_some()).cloned().collect();
     if serving.is_empty() {
-        let known = accounts::models_of(&targets);
-        let known = if known.is_empty() { accounts::read_models(&ctx.paths) } else { known };
+        let known = ctx.models();
         return fail(
             StatusCode::BAD_REQUEST,
             "model_not_found",
