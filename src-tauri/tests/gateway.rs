@@ -228,3 +228,44 @@ fn a_plan_is_addressed_by_its_own_spelling() {
     let want = "glm-5.3-flash";
     assert!(t.models.iter().any(|m| m.eq_ignore_ascii_case(want)));
 }
+
+#[test]
+fn a_thinking_level_becomes_the_one_effort_field_the_plans_read() {
+    let turn = |effort: &str| {
+        let body = json!({
+            "model": "GLM-5.3-Flash",
+            "max_tokens": 4096,
+            "reasoning_effort": effort,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        gateway::translate::to_anthropic(&body, 1024).expect("translates")
+    };
+    let (req, warn) = turn("max");
+    assert!(warn.is_empty(), "{warn:?}");
+    assert_eq!(req["output_config"]["effort"], "max");
+    // 上游只有 low / high / max 三档：medium 落到 high，xhigh 落到 max
+    assert_eq!(turn("medium").0["output_config"]["effort"], "high");
+    assert_eq!(turn("low").0["output_config"]["effort"], "low");
+    assert_eq!(turn("xhigh").0["output_config"]["effort"], "max");
+}
+
+#[test]
+fn a_thinking_level_the_plans_cannot_honour_is_left_to_the_plan() {
+    let body = json!({
+        "model": "GLM-5.3-Flash",
+        "reasoning_effort": "off",
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let (req, warn) = gateway::translate::to_anthropic(&body, 1024).expect("translates");
+    assert!(req.get("output_config").is_none(), "sent an effort after all: {req}");
+    assert!(warn.iter().any(|w| w.contains("off")), "{warn:?}");
+
+    // Anthropic 形状的客户端把档位塞在 thinking.effort 里，大小写不论
+    let body = json!({
+        "model": "GLM-5.3-Flash",
+        "thinking": { "type": "enabled", "effort": "LOW" },
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let (req, _) = gateway::translate::to_anthropic(&body, 1024).expect("translates");
+    assert_eq!(req["output_config"]["effort"], "low");
+}

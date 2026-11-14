@@ -1,5 +1,16 @@
 # 更新日志
 
+## v1.8.1-Z.EMAIL（2026-11-14）
+
+### 新增：思考强度可调（Low / High / Max）
+
+- **OpenAI 侧也能调档**：`POST /v1/chat/completions` 现在会读 `reasoning_effort`（也认 `thinking.effort` / `thinking.level`），翻成上游唯一认的那个字段 `output_config.effort`。`minimal` / `low` → `low`，`medium` / `high` / `auto` / `default` → `high`，`xhigh` / `max` → `max`；认不出的取值不猜，按套餐默认跑，并在响应的 warning 里说明。
+- **为什么必须翻译**：GLM-5.3 系列一律思考、不能关（传 `thinking.type = disabled` 直接被上游 502 `1210`「please use low, high, or max」拒绝），而 `budget_tokens`、顶层的 `reasoning_effort`、`thinking.effort` 直传过去都是静默忽略——只有 `output_config.effort` 真正改变档位。
+- **实测三档确实有差**（同一道应用题、`max_tokens` 8000）：`low` 443 思考字符 / 6.7s，`high` 669 / 9.2s，`max` 1657 / 16.3s，完全不传档位 ≈ 默认最深 5278 / 34.7s。
+- **Anthropic 透传不变**：`POST /v1/messages` 依旧原样转发，客户端自己写 `output_config` 即可。
+
+---
+
 ## v1.8.0-Z.EMAIL（2026-11-14）
 
 ### 新增：本地反代（测试版，OpenAI / Anthropic 双协议）

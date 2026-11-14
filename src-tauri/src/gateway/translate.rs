@@ -124,6 +124,36 @@ fn rnd_suffix(n: usize) -> String {
 /// OpenAI 的 assistant tool_calls 和随后的 tool 结果是两条消息，Anthropic 的 tool_use
 /// 与 tool_result 是普通轮里的 block。弄错这一点的表现是：一次工具调用被 400 回来说
 /// 缺少 tool_result。
+/// effort_request 取客户端说的思考强度。OpenAI 形状的客户端用 reasoning_effort，
+/// Anthropic 形状的客户端把档位塞在 thinking.effort（或 level）里。取值统一小写。
+fn effort_request(obj: &Map<String, Value>) -> Option<String> {
+    let read = |v: &Value| {
+        v.as_str()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(s) = obj.get("reasoning_effort").and_then(read) {
+        return Some(s);
+    }
+    let t = obj.get("thinking")?;
+    t.get("effort")
+        .and_then(read)
+        .or_else(|| t.get("level").and_then(read))
+}
+
+/// normalize_effort 把各家各户的写法收成上游认的三档。上游只认 low / high / max
+///（发别的值会被 1210 拒：This model always engages in thinking; please use low, high, or max），
+/// 中间那档没有 medium，所以 medium 落到 high，xhigh 落到 max。
+fn normalize_effort(raw: &str) -> Option<&'static str> {
+    match raw {
+        "minimal" | "low" => Some("low"),
+        "medium" | "high" | "auto" | "default" => Some("high"),
+        "xhigh" | "max" => Some("max"),
+        // off / none / 不认识的值：上游关不掉思考，只能不发这个字段
+        _ => None,
+    }
+}
+
 pub fn to_anthropic(body: &Value, default_max_tokens: u32) -> Result<(Value, Vec<String>), String> {
     let mut warn: Vec<String> = Vec::new();
     let obj = body
@@ -359,6 +389,19 @@ pub fn to_anthropic(body: &Value, default_max_tokens: u32) -> Result<(Value, Vec
                 }
                 _ => {}
             }
+        }
+    }
+    // 思考强度：上游认的是 output_config.effort（Anthropic 形状的字段），OpenAI 形状的
+    // 客户端说的是 reasoning_effort。不翻这一下，客户端选的 Low / High / Max 到不了模型，
+    // 一律按套餐默认档跑。
+    if let Some(raw) = effort_request(obj) {
+        match normalize_effort(&raw) {
+            Some(level) => {
+                req.insert("output_config".into(), json!({ "effort": level }));
+            }
+            None => warn.push(format!(
+                "reasoning effort {raw} has no ZCode equivalent (the plans only offer low/high/max); left the plan default"
+            )),
         }
     }
     Ok((Value::Object(req), warn))
