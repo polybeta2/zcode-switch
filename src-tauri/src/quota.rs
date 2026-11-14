@@ -144,13 +144,21 @@ pub(crate) fn zcode_app_version() -> String {
 /// 只靠「探测 + 常量」时，旧构建在「缓存从未成功拉取」的情况下会退回过期常量，
 /// 这正是活动被版本门槛过滤的唯一窗口；内置快照把这一层也堵上。
 pub(crate) fn zcode_app_version_for(home: &std::path::Path) -> String {
-    let mut v = detected_app_version();
-    for cand in [bundled_latest(), crate::changelog::cached_latest(home)]
-        .into_iter()
-        .flatten()
-    {
-        if version_ge(&cand, &v) {
-            v = cand;
+    let detected = detected_app_version();
+    let bundled = bundled_latest();
+    let cached = crate::changelog::cached_latest(home);
+    combine_app_version(&detected, bundled.as_deref(), cached.as_deref())
+}
+
+/// 把三层来源合成一个上报版本：本机探测值打底，内置快照与 changelog 缓存只能把它往上顶。
+///
+/// 单独拆出来是为了可测：探测值读的是「这台机器装了什么」，测试机上装了 3.18.2 就得到
+/// 3.18.2，断言里写死常量必然红。合成规则本身与机器无关，才适合直接断言。
+pub(crate) fn combine_app_version(detected: &str, bundled: Option<&str>, cached: Option<&str>) -> String {
+    let mut v = detected.to_string();
+    for cand in [bundled, cached].into_iter().flatten() {
+        if version_ge(cand, &v) {
+            v = cand.to_string();
         }
     }
     v
@@ -1918,6 +1926,30 @@ mod version_tests {
         assert_eq!(bundled_latest_from(&dir), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 合成规则：探测值打底，只有更高的来源才顶上去（低的不许把版本拉低）。
+    #[test]
+    fn combine_app_version_takes_the_highest_source() {
+        use super::combine_app_version;
+        // 只有探测值
+        assert_eq!(combine_app_version("3.18.2", None, None), "3.18.2");
+        // 内置快照更高：顶上去
+        assert_eq!(combine_app_version("3.17.2", Some("3.18.0"), None), "3.18.0");
+        // 缓存更高：顶上去
+        assert_eq!(combine_app_version("3.17.2", None, Some("3.19.0")), "3.19.0");
+        // 都更旧：不许把版本拉低（旧缓存是最常见的形态）
+        assert_eq!(combine_app_version("3.18.2", Some("3.16.3"), Some("3.16.2")), "3.18.2");
+        // 相等时取到同样的值，不会出现 "3.18.2.0" 这类改写
+        assert_eq!(combine_app_version("3.18.2", Some("3.18.2"), None), "3.18.2");
+    }
+
+    /// 上报版本永不低于编译期常量——这是「不被服务端版本门槛过滤」的底线。
+    #[test]
+    fn combine_app_version_never_goes_below_the_constant() {
+        use super::{combine_app_version, version_ge, CLIENT_APP_VERSION};
+        let v = combine_app_version(CLIENT_APP_VERSION, None, None);
+        assert!(version_ge(&v, CLIENT_APP_VERSION), "got {v}");
     }
 
     #[test]

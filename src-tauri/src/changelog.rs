@@ -297,14 +297,22 @@ mod tests {
         std::fs::write(cache_file(home), body).unwrap();
     }
 
-    /// 无缓存：必须标记 stale（上报版本可能落后），但 reported 仍取常量。
+    /// 无缓存：必须标记 stale（上报版本可能落后），reported 不得低于常量。
+    ///
+    /// 这里以前断言 reported == CLIENT_APP_VERSION，在装了 ZCode 的开发机上必然红：
+    /// reported 是 max(本机探测, 内置快照, 缓存)，本机探测到 3.18.2 就是 3.18.2。
+    /// 与机器无关的合成规则在 quota::version_tests 里单独测，这里只守合同。
     #[test]
     fn version_status_without_cache_is_stale() {
         let home = temp_home("none");
         let s = version_status(&home);
         assert!(s.stale, "缺缓存必须视为过期");
         assert_eq!(s.latest, None);
-        assert_eq!(s.reported, crate::quota::CLIENT_APP_VERSION);
+        assert!(
+            crate::quota::version_ge(&s.reported, crate::quota::CLIENT_APP_VERSION),
+            "reported {} 低于常量",
+            s.reported
+        );
         assert!(!s.constant_behind);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -316,7 +324,8 @@ mod tests {
         let s = version_status(&home);
         assert!(!s.stale);
         assert_eq!(s.latest.as_deref(), Some("3.17.2"));
-        assert_eq!(s.reported, "3.17.2");
+        // latest 就是缓存值；reported 取三层来源的最大值，只保证不低于它
+        assert!(crate::quota::version_ge(&s.reported, "3.17.2"), "reported {}", s.reported);
         assert!(!s.constant_behind, "常量已升到 3.17.2，不应落后");
         assert!(s.cache_age_secs.unwrap() >= 60);
         let _ = std::fs::remove_dir_all(&home);
@@ -340,8 +349,12 @@ mod tests {
         write_cache_json(&home, "3.16.3", CACHE_TTL_SECS + 3600);
         let s = version_status(&home);
         assert!(s.stale, "超过 TTL 必须标记过期");
-        // 过期缓存仍参与 max（旧值也可能比常量新），这里缓存更旧，所以上报仍取常量
-        assert_eq!(s.reported, crate::quota::CLIENT_APP_VERSION);
+        // 过期缓存仍参与 max（旧值也可能比常量新），这里缓存更旧，所以上报不低于常量
+        assert!(
+            crate::quota::version_ge(&s.reported, crate::quota::CLIENT_APP_VERSION),
+            "reported {} 低于常量",
+            s.reported
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
